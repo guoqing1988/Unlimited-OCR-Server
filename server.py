@@ -453,7 +453,9 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     img_dir = IMAGES_DIR / req_id
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 第4步：编译 det 标签正则表达式 ──
+    # 检测列表项/独立条目: 以数字序号、破折号、圆点等开头
+    # "01 xxx", "02 xxx", "- xxx", "1. xxx", "• xxx"
+    _listish_pattern = re.compile(r'^(\d{1,2}\s|[•\-\*\–\—]\s|\d+\.\s)')
     # 匹配格式：<|det|>类型名 [坐标列表]<|/det|>
     # 类型名：字母开头，后续可含字母数字下划线连字符（如 header, title, image）
     # 坐标：方括号内的任意非方括号字符（如 [27,26,252,37]）
@@ -473,23 +475,31 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     last_heading = ""         # 记录最近遇到的标题文本，作为后续图片的 alt
     image_idx = 0             # 图片序号，用于文件命名（N.jpg）
     prev_type = ""            # 上一行的 det 类型
+    prev_is_listish_flag = False  # 上一行是否为列表项（用于连续列表项合并）
 
     for line in lines:
         m = det_pattern.search(line)
 
         if not m:
             # ── 无 det 标签的行（孤立行） ──
-            # 例如 "Niche by Zaha Hadid"（副标题）、"Text: xxx"（命名实体）
-            # 孤立行是独立的语义单元，不与上下文件合并
             line_clean = line.strip()
             if line_clean:
-                # 与上方内容加空行分隔（除非是文档开头）
-                if prev_type:
+                # 检测列表项：以序号、破折号、圆点开头
+                if _listish_pattern.match(line_clean):
+                    # 连续列表项不加空行
+                    if prev_type and not (prev_type == "text" and prev_is_listish_flag):
+                        result_lines.append("")
+                    result_lines.append("- " + line_clean)
+                    prev_type = "text"
+                    prev_is_listish_flag = True
+                else:
+                    # 孤立行前后加空行
+                    if prev_type:
+                        result_lines.append("")
+                    result_lines.append(line_clean)
                     result_lines.append("")
-                result_lines.append(line_clean)
-                # 孤立行后也加空行，与下文分隔
-                result_lines.append("")
-                prev_type = "orphan"
+                    prev_type = "orphan"
+                    prev_is_listish_flag = False
             continue
 
         # ── 解析 det 标签 ──
@@ -577,10 +587,22 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                     result_lines.append(md_line)
                     prev_type = det_type
                 else:
-                    # 正文段落：text→text 合并不加空行
-                    if prev_type not in ("", "text"):
-                        result_lines.append("")
-                    result_lines.append(md_line)
+                    # 正文段落
+                    # 检测当前行是否为列表项（01, 02, - item, 1. item 等）
+                    # 列表项不应与上文合并，需独立成行
+                    cur_is_listish = bool(_listish_pattern.match(text_after))
+                    # 上一行也是列表项 → 不加空行（连续列表项保持紧凑）
+                    prev_was_listish = bool(prev_type == "text" and prev_is_listish_flag)
+                    if cur_is_listish:
+                        if not prev_was_listish:
+                            result_lines.append("")  # 普通文本 → 列表，加空行
+                        result_lines.append("- " + text_after)  # 统一用 - 前缀
+                        prev_is_listish_flag = True
+                    else:
+                        if prev_type not in ("", "text") or prev_is_listish_flag:
+                            result_lines.append("")
+                        result_lines.append(md_line)
+                        prev_is_listish_flag = False
                     prev_type = "text"
 
         # 注意：det_type 为非 image 且 keep_text=False 的情况（如 page_number）
