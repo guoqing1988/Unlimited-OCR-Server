@@ -335,28 +335,24 @@ def decode_image(s: str) -> str:
 
 def extract_messages(messages: list[Message]) -> tuple[str, list[str], list[str]]:
     """
-    解析 OpenAI 格式的消息，提取 prompt 文本和所有图片路径。
-
-    支持的 content 格式:
-        - 纯文本:     {"content": "some text"}
-        - 多模态块:   {"content": [{"type":"text",...}, {"type":"image_url",...}]}
+    解析 OpenAI 格式的消息，提取 prompt 文本和所有图片/PDF 路径。
 
     支持的图片来源:
-        - data:image/...;base64,...   base64 编码的 data URI
-        - http://... / https://...   远程下载
-        - /path/to/file.jpg          本地文件路径
+        - data:image/...;base64,...   图片 base64
+        - data:application/pdf;base64,...  PDF base64
+        - http://host/doc.pdf         远程 PDF（自动下载）
+        - http://host/img.jpg         远程图片（自动下载）
+        - /absolute/path/file.jpg     本地图片
+        - /absolute/path/file.pdf     本地 PDF（自动转图片）
 
     返回:
-        (prompt文本, 所有图片路径列表, 所有临时文件路径列表)
-    注意：返回值从 (str, str|None, list) 改为 (str, list, list)
-    所有图片路径都返回，单图时列表只有1个元素，多图时列表包含所有图片。
+        (prompt文本, 所有文件路径列表, 临时文件路径列表)
     """
     parts, imgs, temps = [], [], []
 
     for msg in messages:
         content = msg.content
         if isinstance(content, str):
-            # 纯文本消息
             parts.append(content)
         elif isinstance(content, list):
             for p in content:
@@ -367,14 +363,19 @@ def extract_messages(messages: list[Message]) -> tuple[str, list[str], list[str]
                     url = (p.get("image_url") or {}).get("url", "")
                     fpath = None
                     if url.startswith("data:"):
+                        # base64 编码: data:image/png;base64,... 或 data:application/pdf;base64,...
                         fpath = decode_image(url)
                     elif url.startswith(("http://", "https://")):
+                        # 远程 URL: 根据扩展名决定后缀（PDF 会被后续检测到并转图片）
                         import urllib.request
-                        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                        url_lower = url.split("?")[0]  # 去掉查询参数
+                        suffix = ".pdf" if url_lower.endswith(".pdf") else ".png"
+                        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
                         urllib.request.urlretrieve(url, tmp.name)
                         tmp.close()
                         fpath = tmp.name
                     elif os.path.isfile(url):
+                        # 本地绝对路径
                         fpath = url
                     if fpath:
                         temps.append(fpath)
