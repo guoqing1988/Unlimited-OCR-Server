@@ -477,6 +477,8 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
             line_clean = line.strip()
             if line_clean:
                 result_lines.append(line_clean)
+                # 文本段落后插入空行，确保 Markdown 渲染时与后续内容分隔
+                result_lines.append("")
             continue
 
         # ── 解析 det 标签 ──
@@ -556,6 +558,9 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
 
             image_idx += 1  # 图片序号递增
 
+            # 图片后插入空行，与后续段落分隔
+            result_lines.append("")
+
         elif keep_text:
             # ── 文本类型：添加 Markdown 标题前缀 ──
             # header  → "# CITYMAGAZINE / JUL 2009 / SPY"
@@ -571,14 +576,18 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                 else:
                     # 普通文本段落，不加前缀直接输出
                     result_lines.append(md_line)
+                    # 段落后插入空行，确保 Markdown 渲染时与后续的标题/图片分隔
+                    result_lines.append("")
 
         # 注意：det_type 为非 image 且 keep_text=False 的情况（如 page_number）
         # 直接跳过，不输出任何内容
 
-    # ── 第6步：清理残留标记并返回 ──
+    # ── 第6步：清理并返回 ──
     # 替换 LaTeX 数学模式转义字符为标准符号
     result = '\n'.join(result_lines)
     result = result.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
+    # 压缩连续的多个空行为单个空行（Markdown 规范：段落间一个空行即可）
+    result = re.sub(r'\n{3,}', '\n\n', result)
 
     return result.strip()
 
