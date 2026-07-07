@@ -380,13 +380,33 @@ Jenny: 我最鍾意北歐設計刀具，Fiskars 這個牌子足有350年歷史..
 
 ## Prompt 参考
 
-| Prompt | 用途 |
-|--------|------|
-| `<image>\nFree OCR.` | 通用文档解析（默认） |
-| `<image>\ndocument parsing.` | 文档解析 |
-| `<image>\nMulti page parsing.` | 多页/PDF（自动使用） |
-| `<image>\nParse the figure.` | 图表解析 |
-| `<image>\nExtract the text in the image.` | 纯文本提取 |
+Unlimited-OCR 使用 `<image>` 标记指定图片位置，支持多种 prompt 适配不同场景。
+
+### 内置 Prompt 预设
+
+| Prompt | 用途 | 输出特点 |
+|--------|------|----------|
+| `<image>\nFree OCR.` | **通用文档解析（默认）** | 自动识别标题、正文、图片，输出结构化 Markdown |
+| `<image>\n<\|grounding\|>Convert the document to markdown.` | 结构化 Markdown | 同 DS-OCR-2 的 grounding 模式 |
+| `<image>\ndocument parsing.` | 文档解析（官方示例） | 与官方 README 一致 |
+| `<image>\nMulti page parsing.` | 多页文档/PDF | 多图时自动使用，页间 `<PAGE>` 分隔 |
+| `<image>\nParse the figure.` | 图表解析 | 专注图表结构提取 |
+| `<image>\nExtract the text in the image.` | 纯文本提取 | 跳过布局分析，仅提取文字 |
+
+### 使用示例
+
+```python
+# 默认通用模式（推荐）
+{"type": "text", "text": "<image>\nFree OCR."}
+
+# 指定图片位置，自由组合提示词
+{"type": "text", "text": "<image>\n识别图片中的表格内容。"}
+{"type": "text", "text": "<image>\n提取所有文字，保留原有格式。"}
+
+# 多图模式（≥2 张图片时自动切换，无需手动指定 prompt）
+```
+
+> `<image>` 是视觉编码器的占位标记，prompt 中必须至少包含一个。 |
 
 ---
 
