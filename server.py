@@ -381,133 +381,190 @@ def extract_messages(messages: list[Message]) -> tuple[str, str | None, list[str
 
 def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> str:
     """
-    将模型 raw 输出（含 <|det|> 标签）处理为完整 Markdown。
+    将模型 eval_mode=True 返回的 raw 文本处理为完整 Markdown。
 
-    处理管线:
-    1. 去除 EOS 标记
-    2. 按行解析 <|det|>类型 [坐标]<|/det|> 标签
-    3. 类型映射到 Markdown 格式：
-       header   → # 标题
-       title    → ## 标题
-       subtitle → ### 标题
-       text     → 纯文本段落
-       image    → 从原图裁剪保存，替换为 ![](images/{req_id}/N.jpg)
-       page_number → 跳过
-    4. 为图片自动生成 alt 文本（向前搜索最近的标题）
-    5. 清理残留标记
+    Unlimited-OCR 模型在 eval_mode=True 时返回的原始文本格式如下：
+        Text: "Free Speech & Data"
+        <|det|>header [27, 26, 252, 37]<|/det|>CITYMAGAZINE / JUL 2009 / SPY
+        <|det|>title [28, 381, 215, 399]<|/det|>[Fiskars] 芬蘭釵剪
+        <|det|>image [27, 85, 387, 364]<|/det|>
+        ...
 
-    返回:
-        格式化后的 Markdown 字符串。
+    其中 <|det|> 标签的含义：
+        - header:  页面主标题  → 映射为 # 一级标题
+        - title:   区域标题    → 映射为 ## 二级标题
+        - subtitle:区域副标题  → 映射为 ### 三级标题
+        - text:    正文段落    → 保留纯文本
+        - image:   嵌入图片    → 按坐标裁剪原图，替换为 ![](images/{req_id}/N.jpg)
+        - page_number: 页码   → 跳过不输出
+
+    坐标格式 [x1, y1, x2, y2] 归一化到 [0, 999]，需要按实际图片尺寸映射到像素坐标。
+
+    alt 文本策略：
+        记录最近遇到的 header/title/subtitle，后续 image 标签的 alt 自动使用该标题。
+        若无标题，则降级为 "image"。
+
+    Args:
+        raw_text:            模型 eval_mode=True 返回的原始文本
+        original_image_path: 原始输入图片的路径（用于裁剪提取子图）
+        req_id:              本次请求的唯一标识，用于图片子目录命名
+
+    Returns:
+        格式化后的 Markdown 字符串（含标题层级、图片引用和 alt 文本）
     """
+    # 延迟导入，避免循环依赖
     from PIL import Image as PILImage
 
-    # 去除 EOS 标记
+    # ── 第1步：去除 EOS 终止标记 ──
+    # 模型生成会在末尾附加 EOS token "<｜end▁of▁sentence｜>"
     stop_str = '<｜end▁of▁sentence｜>'
     if raw_text.endswith(stop_str):
         raw_text = raw_text[:-len(stop_str)]
     raw_text = raw_text.strip()
 
-    # 加载原图用于裁剪
+    # ── 第2步：加载原始图片（用于后续按坐标裁剪） ──
+    # 图片宽高用于将 [0,999] 归一化坐标映射到实际像素坐标
+    # 例如：坐标 [100, 50, 300, 200] 在 800×600 图片上对应像素区域 (80, 30, 240, 120)
     try:
         orig_img = PILImage.open(original_image_path)
         img_w, img_h = orig_img.size
     except Exception:
+        # 如果原图加载失败，后面裁剪会跳过，但不阻塞 Markdown 文本生成
         orig_img = None
         img_w, img_h = 1, 1
 
-    # 准备图片输出目录
+    # ── 第3步：准备图片输出目录 ──
+    # 提取的子图保存到 images/{req_id}/，通过 FastAPI StaticFiles 对外服务
+    # URL 访问路径：http://host:port/images/{req_id}/0.jpg
     img_dir = IMAGES_DIR / req_id
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # det 标签正则：匹配 <|det|>类型 [坐标]<|/det|> 格式的行
+    # ── 第4步：编译 det 标签正则表达式 ──
+    # 匹配格式：<|det|>类型名 [坐标列表]<|/det|>
+    # 类型名：字母开头，后续可含字母数字下划线连字符（如 header, title, image）
+    # 坐标：方括号内的任意非方括号字符（如 [27,26,252,37]）
     det_pattern = re.compile(
         r'<\|det\|>\s*([A-Za-z_][\w-]*)\s*(\[[^\]]+\])\s*<\|/det\|>'
     )
 
+    # ── 第5步：逐行解析并构建 Markdown ──
     lines = raw_text.split('\n')
-    result_lines = []         # 最终输出的 Markdown 行
-    last_heading = ""         # 记录最近的标题，用于生成图片 alt
-    image_idx = 0             # 图片序号
+    result_lines = []         # 最终输出的 Markdown 行列表
+    last_heading = ""         # 记录最近遇到的标题文本，作为后续图片的 alt
+    image_idx = 0             # 图片序号，用于文件命名（N.jpg）
 
     for line in lines:
+        # 在当前行中搜索 det 标签
         m = det_pattern.search(line)
 
         if not m:
-            # 没有 det 标签的行 → 原样保留
+            # ── 无 det 标签的行：直接保留文本内容 ──
+            # 例如第一行 "Text: \"Free Speech & Data\"" 没有标签
             line_clean = line.strip()
             if line_clean:
                 result_lines.append(line_clean)
             continue
 
-        det_type = m.group(1).strip()
-        coords_str = m.group(2)
+        # ── 解析 det 标签 ──
+        # 示例: "<|det|>title [28, 381, 215, 399]<|/det|>[Fiskars] 芬蘭釵剪"
+        #   → det_type = "title"
+        #   → coords_str = "[28, 381, 215, 399]"
+        #   → text_after = "[Fiskars] 芬蘭釵剪"
+        det_type = m.group(1).strip()      # 区域类型（header/title/text/image/page_number）
+        coords_str = m.group(2)            # 坐标字符串（如 "[27,26,252,37]"）
 
-        # 提取标签后面的文本内容
+        # 标签后面的文本是实际内容（标题文本、正文、产品名等）
         text_after = line[m.end():].strip()
 
-        # 查找该类型在映射表中的配置
+        # ── 查找该类型在映射表中的配置 ──
+        # DET_TYPE_MAP 定义了每种类型如何转换为 Markdown
+        # 例如: "title" → ("## ", True)  表示使用 ## 前缀且保留文本
         mapping = DET_TYPE_MAP.get(det_type)
         if mapping is None:
-            # 未知类型 → 只保留文本
+            # 未知类型（模型可能输出新的标签类型）→ 只保留文本内容
             if text_after:
                 result_lines.append(text_after)
             continue
 
         prefix, keep_text = mapping
 
+        # ── 图片类型：特殊处理 ──
         if det_type == "image":
-            # ── 图片处理：从原图裁剪 ──
+            # 解析坐标字符串为 Python 列表
+            # 格式可能是 "[x1,y1,x2,y2]" 或 "[[x1,y1,x2,y2], [x1,y1,x2,y2], ...]"
             try:
                 coords = eval(coords_str)
+                # 如果是单个坐标组 [100, 50, 300, 200]，包装为 [[100, 50, 300, 200]]
                 if coords and isinstance(coords[0], (int, float)):
                     coords = [coords]
             except Exception:
+                # 坐标解析失败（格式异常），跳过此图片
                 coords = []
 
+            # 遍历可能的多组坐标（一个 image 区域可能包含多张子图）
             for ci, c in enumerate(coords):
                 try:
+                    # 将 [0,999] 归一化坐标映射到实际像素坐标
+                    # 公式：像素坐标 = 归一化坐标 / 999 × 实际尺寸
                     x1 = int(c[0] / 999 * img_w)
                     y1 = int(c[1] / 999 * img_h)
                     x2 = int(c[2] / 999 * img_w)
                     y2 = int(c[3] / 999 * img_h)
 
+                    # 只有坐标有效且原图加载成功才执行裁剪
                     if orig_img is not None and x2 > x1 and y2 > y1:
                         cropped = orig_img.crop((x1, y1, x2, y2))
+                        # 多图时加 _ci 后缀区分：0_0.jpg, 0_1.jpg
                         suffix = f"_{ci}" if len(coords) > 1 else ""
                         cropped.save(str(img_dir / f"{image_idx}{suffix}.jpg"))
                 except Exception:
+                    # 单张图片裁剪失败不影响其他图片
                     continue
 
-            # 生成 alt 文本
+            # ── 生成 alt 文本 ──
+            # 策略：使用最近遇到的标题（由 header/title/subtitle 标签记录）
+            # 如果前面没有标题，降级为 "image"
             alt = last_heading if last_heading else "image"
 
-            # 构建 Markdown 图片引用
+            # ── 构建 Markdown 图片引用 ──
+            # 单图: ![标题文本](images/req_id/0.jpg)
+            # 多图: ![标题文本 (1)](images/req_id/0_0.jpg)
+            #       ![标题文本 (2)](images/req_id/0_1.jpg)
             if len(coords) == 1:
-                result_lines.append(f"![{alt}](images/{req_id}/{image_idx}.jpg)")
+                result_lines.append(
+                    f"![{alt}](images/{req_id}/{image_idx}.jpg)"
+                )
             else:
                 for ci in range(len(coords)):
                     result_lines.append(
                         f"![{alt} ({ci+1})](images/{req_id}/{image_idx}_{ci}.jpg)"
                     )
 
-            image_idx += 1
+            image_idx += 1  # 图片序号递增
 
         elif keep_text:
-            # ── 文本类型：添加 Markdown 前缀 ──
+            # ── 文本类型：添加 Markdown 标题前缀 ──
+            # header  → "# CITYMAGAZINE / JUL 2009 / SPY"
+            # title   → "## [Fiskars] 芬蘭釵剪"
+            # text    → "Jenny: 我最鍾意北歐設計刀具..."
             md_line = f"{prefix}{text_after}" if text_after else ""
             if md_line:
-                # 记录标题用于后续图片 alt
+                # 记录标题文本，后续图片将使用此文本作为 alt
                 if det_type in ("header", "title", "subtitle"):
                     last_heading = text_after if text_after else last_heading
-                    result_lines.append("")     # 标题前空一行
+                    result_lines.append("")     # 标题前插入空行，符合 Markdown 规范
                     result_lines.append(md_line)
                 else:
+                    # 普通文本段落，不加前缀直接输出
                     result_lines.append(md_line)
 
-        # det_type 为非 image 且 keep_text=False（如 page_number）→ 跳过
+        # 注意：det_type 为非 image 且 keep_text=False 的情况（如 page_number）
+        # 直接跳过，不输出任何内容
 
-    # 清理残留的 LaTeX 转义
-    result = '\n'.join(result_lines).replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
+    # ── 第6步：清理残留标记并返回 ──
+    # 替换 LaTeX 数学模式转义字符为标准符号
+    result = '\n'.join(result_lines)
+    result = result.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
 
     return result.strip()
 
