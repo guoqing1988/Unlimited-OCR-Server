@@ -64,5 +64,8 @@ python infer.py --pdf ./examples/document.pdf --output_dir ./outputs --concurren
 ## 编码规范
 
 - 符合 PEP 8，4 空格缩进
+- 所有代码注释必须使用中文编写，注释要详细完整
+- 每个函数/类必须有 docstring 说明用途、参数和返回值
+- 关键逻辑段落用 `# ── 标题 ──` 分隔符标注，增强可读性
 - 推理后端扩展代码放在对应后端模块中，不混入通用模块
 - 提交 PR 需附带单测，GitHub Actions 必须通过

@@ -277,6 +277,12 @@ class ChatCompletionRequest(BaseModel):
 
     与 OpenAI Chat Completions API 对齐。核心字段是 messages，
     需包含至少一个 image_url 类型的多模态内容块。
+
+    Unlimited-OCR 扩展字段:
+        max_pages:   PDF/多图时最多处理多少页。None=全部。例如 max_pages=10 只处理前10页。
+        page_mode:   多图处理模式。
+                     "batch" (默认) — infer_multi 一次推理，跨页上下文连贯
+                     "single"        — 逐张 infer，640 gundam 高质量，速度快
     """
     model: str = "Unlimited-OCR"
     messages: list[Message] = Field(default_factory=list)
@@ -287,6 +293,15 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stop: list[str] | None = None
     user: str | None = None
+    # ── Unlimited-OCR 扩展字段 ──
+    # max_pages: PDF/多图时最多处理多少页。None=全部页。
+    #   例如 max_pages=5 只取前5页，适合预览或限制 token 消耗
+    max_pages: int | None = None
+
+    # page_mode: 多图处理策略（单图时忽略，始终用 gundam 640）
+    #   "batch"  — 默认，infer_multi 批量推理，跨页上下文连贯但速度略慢
+    #   "single" — 逐张 infer gundam 640，每页独立推理，速度更快且质量更高
+    page_mode: str = "batch"
 
     class Config:
         populate_by_name = True
@@ -754,6 +769,10 @@ async def chat_completions(req: ChatCompletionRequest):
             if "Multi page" not in prompt:
                 prompt = "<image>\nMulti page parsing."
 
+        # ── 应用 max_pages 限制（仅对多图/PDF 生效） ──
+        if req.max_pages is not None and req.max_pages > 0 and len(imgs) > req.max_pages:
+            imgs = imgs[:req.max_pages]
+
         # ── 第2步：按需加载模型 ──
         _ensure_loaded()
         _touch_used()
@@ -764,47 +783,54 @@ async def chat_completions(req: ChatCompletionRequest):
             if _model is None:
                 return error_response(503, "模型未加载", "server_error")
 
-            if len(imgs) == 1:
-                # ═══════════════════════════════════════════════════════
-                # 单图模式: model.infer() + eval_mode=True
-                # 参数: gundam 模式, crop_mode=True, image_size=640
-                # ═══════════════════════════════════════════════════════
-                orig_copy = IMAGES_DIR / req_id / "_original.png"
-                orig_copy.parent.mkdir(parents=True, exist_ok=True)
-                from PIL import Image as PILImage
-                PILImage.open(imgs[0]).save(str(orig_copy))
+            # 决定使用哪种推理路径
+            use_batch = (len(imgs) > 1 and req.page_mode == "batch")
 
-                raw_text = _model.infer(
-                    _tokenizer,
-                    prompt=prompt,
-                    image_file=imgs[0],
-                    output_path='/tmp/unused',
-                    base_size=1024,
-                    image_size=640,
-                    crop_mode=True,
-                    max_length=32768,
-                    no_repeat_ngram_size=35,
-                    ngram_window=128,
-                    save_results=False,
-                    eval_mode=True,
-                )
-                text = process_raw_output(raw_text, str(orig_copy), req_id) or "[empty]"
-
-            else:
+            if len(imgs) == 1 or req.page_mode == "single":
                 # ═══════════════════════════════════════════════════════
-                # 多图模式: 自动分批处理，每批 ≤ MAX_PAGES_PER_BATCH 页
-                # 每批独立调用 infer_multi()，结果用 --- 合并
+                # 逐张模式: model.infer() gundam 640 crop_mode
+                # 高质量、快速。多图时逐张循环处理，结果用 --- 合并。
+                # ═══════════════════════════════════════════════════════
+                all_processed = []
+                for page_idx, img_path in enumerate(imgs):
+                    orig_copy = IMAGES_DIR / req_id / f"_page_{page_idx}.png"
+                    orig_copy.parent.mkdir(parents=True, exist_ok=True)
+                    from PIL import Image as PILImage
+                    PILImage.open(img_path).save(str(orig_copy))
+
+                    raw_text = _model.infer(
+                        _tokenizer,
+                        prompt=prompt,
+                        image_file=img_path,
+                        output_path='/tmp/unused',
+                        base_size=1024,
+                        image_size=640,
+                        crop_mode=True,
+                        max_length=32768,
+                        no_repeat_ngram_size=35,
+                        ngram_window=128,
+                        save_results=False,
+                        eval_mode=True,
+                    )
+                    page_md = process_raw_output(raw_text, str(orig_copy), f"{req_id}/page_{page_idx}")
+                    if page_md and page_md != "[empty]":
+                        all_processed.append(page_md)
+
+                text = "\n\n---\n\n".join(all_processed) if all_processed else "[empty]"
+
+            elif use_batch:
+                # ═══════════════════════════════════════════════════════
+                # 批量模式: model.infer_multi() base 1024 跨页连贯
                 # ═══════════════════════════════════════════════════════
                 total_pages = len(imgs)
                 batch_size = MAX_PAGES_PER_BATCH
                 all_processed = []
-                global_page_idx = 0  # 跨批次的全局页码
+                global_page_idx = 0
 
                 for batch_start in range(0, total_pages, batch_size):
                     batch_end = min(batch_start + batch_size, total_pages)
                     batch_imgs = imgs[batch_start:batch_end]
 
-                    # 重定向 stdout（infer_multi 内部使用 TPSTextStreamer）
                     old_stdout = sys.stdout
                     sys.stdout = _io.StringIO()
                     try:
@@ -822,25 +848,21 @@ async def chat_completions(req: ChatCompletionRequest):
                     finally:
                         sys.stdout = old_stdout
 
-                    # 按 <PAGE> 分割每页输出
                     pages = raw_output.split('<PAGE>')[1:]
                     for page_raw in pages:
                         page_raw = page_raw.strip()
                         if not page_raw:
                             continue
-
                         if global_page_idx < total_pages:
                             page_copy = IMAGES_DIR / req_id / f"_page_{global_page_idx}.png"
                             page_copy.parent.mkdir(parents=True, exist_ok=True)
                             from PIL import Image as PILImage
                             PILImage.open(imgs[global_page_idx]).save(str(page_copy))
-
                             page_md = process_raw_output(
                                 page_raw, str(page_copy), f"{req_id}/page_{global_page_idx}"
                             )
                             if page_md and page_md != "[empty]":
                                 all_processed.append(page_md)
-
                         global_page_idx += 1
 
                 text = "\n\n---\n\n".join(all_processed) if all_processed else "[empty]"
