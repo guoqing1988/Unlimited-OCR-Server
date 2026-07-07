@@ -478,14 +478,18 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
         m = det_pattern.search(line)
 
         if not m:
-            # ── 无 det 标签的行：视为 text ──
+            # ── 无 det 标签的行（孤立行） ──
+            # 例如 "Niche by Zaha Hadid"（副标题）、"Text: xxx"（命名实体）
+            # 孤立行是独立的语义单元，不与上下文件合并
             line_clean = line.strip()
             if line_clean:
-                # 类型变化时加空行分隔（但 text→text 不需要）
-                if prev_type not in ("", "text"):
+                # 与上方内容加空行分隔（除非是文档开头）
+                if prev_type:
                     result_lines.append("")
                 result_lines.append(line_clean)
-                prev_type = "text"
+                # 孤立行后也加空行，与下文分隔
+                result_lines.append("")
+                prev_type = "orphan"
             continue
 
         # ── 解析 det 标签 ──
