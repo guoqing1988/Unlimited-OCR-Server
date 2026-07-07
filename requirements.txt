@@ -1,0 +1,24 @@
+# GPU（必须先从 PyTorch 官方 CUDA 12.8 索引安装）
+# uv pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+# torch==2.10.0
+# torchvision==0.25.0
+
+# 模型推理
+transformers==4.57.1
+tokenizers==0.22.2
+safetensors==0.8.0
+pillow==12.1.1
+matplotlib==3.10.8
+einops==0.8.2
+addict==2.4.0
+easydict==1.13
+pymupdf==1.27.2.2
+psutil==7.2.2
+
+# Web 服务
+fastapi==0.139.0
+uvicorn[standard]==0.50.2
+python-dotenv==1.2.2
+python-multipart==0.0.20
+pydantic==2.13.4
+requests==2.34.2

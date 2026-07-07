@@ -1,0 +1,25 @@
+[Unit]
+Description=Unlimited-OCR API 服务 (Transformers)
+Documentation=https://github.com/baidu/Unlimited-OCR
+After=network.target remote-fs.target
+
+[Service]
+Type=simple
+User=liu
+Group=liu
+WorkingDirectory=/data/www/wwwroot/Unlimited-OCR
+EnvironmentFile=-/data/www/wwwroot/Unlimited-OCR/.env
+Environment="PATH=/data/www/wwwroot/Unlimited-OCR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="CUDA_VISIBLE_DEVICES=0"
+ExecStart=/data/www/wwwroot/Unlimited-OCR/.venv/bin/uvicorn server:app --host ${HOST} --port ${PORT}
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+# GPU 访问权限
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
