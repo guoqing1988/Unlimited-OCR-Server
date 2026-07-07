@@ -15,6 +15,7 @@ Unlimited-OCR：OpenAI 兼容 OCR 推理服务，基于 HuggingFace Transformers
 """
 
 import os
+import sys
 import gc
 import threading
 import base64
@@ -25,8 +26,15 @@ import tempfile
 import traceback
 import shutil
 import re
+import warnings
 from pathlib import Path
 from typing import Optional
+
+# 屏蔽 Transformers generate() 内部关于 attention_mask/pad_token_id 的冗余警告
+# 模型使用 images_seq_mask 管理视觉 token 的注意力，不需要标准 attention_mask
+# 实测不影响输出质量，仅减少日志噪音
+warnings.filterwarnings("ignore", message=".*attention_mask.*")
+warnings.filterwarnings("ignore", message=".*pad_token_id.*")
 
 # 加载 .env 文件（优先级低于系统环境变量）
 from dotenv import load_dotenv
@@ -325,9 +333,9 @@ def decode_image(s: str) -> str:
     return tmp.name
 
 
-def extract_messages(messages: list[Message]) -> tuple[str, str | None, list[str]]:
+def extract_messages(messages: list[Message]) -> tuple[str, list[str], list[str]]:
     """
-    解析 OpenAI 格式的消息，提取 prompt 文本和图片路径。
+    解析 OpenAI 格式的消息，提取 prompt 文本和所有图片路径。
 
     支持的 content 格式:
         - 纯文本:     {"content": "some text"}
@@ -339,9 +347,11 @@ def extract_messages(messages: list[Message]) -> tuple[str, str | None, list[str
         - /path/to/file.jpg          本地文件路径
 
     返回:
-        (prompt文本, 第一张图片路径, 所有临时文件路径列表)
+        (prompt文本, 所有图片路径列表, 所有临时文件路径列表)
+    注意：返回值从 (str, str|None, list) 改为 (str, list, list)
+    所有图片路径都返回，单图时列表只有1个元素，多图时列表包含所有图片。
     """
-    parts, img, temps = [], None, []
+    parts, imgs, temps = [], [], []
 
     for msg in messages:
         content = msg.content
@@ -368,15 +378,19 @@ def extract_messages(messages: list[Message]) -> tuple[str, str | None, list[str
                         fpath = url
                     if fpath:
                         temps.append(fpath)
-                        # 使用第一张图片作为推理输入，其余在多图模式下使用
-                        if img is None:
-                            img = fpath
+                        imgs.append(fpath)
 
-    # 组装 prompt，确保包含 <image> 标记供视觉编码器使用
-    prompt = "\n".join(parts) if parts else "<image>\nFree OCR."
+    # 组装 prompt
+    # 多图时使用 "Multi page parsing." 提示词，单图时使用 "Free OCR."
+    if len(imgs) > 1:
+        default_prompt = "<image>\nMulti page parsing."
+    else:
+        default_prompt = "<image>\nFree OCR."
+
+    prompt = "\n".join(parts) if parts else default_prompt
     if "<image>" not in prompt:
         prompt = "<image>\n" + prompt
-    return prompt, img, temps
+    return prompt, imgs, temps
 
 
 def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> str:
@@ -660,59 +674,140 @@ async def chat_completions(req: ChatCompletionRequest):
     """
     OCR 推理主接口（OpenAI Chat Completions 兼容）。
 
-    接受多模态 messages（文本 + 图片），调用 model.infer() 同步推理。
-    支持 stream=True 以 SSE 方式流式返回结果。
+    支持单图和多图两种模式:
+    - 单图 (1 张 image_url): 使用 gundam 模式（crop_mode=True, image_size=640）
+    - 多图 (≥2 张 image_url): 使用 base 模式（image_size=1024），一次推理处理所有页
+      输出页间用 <PAGE> 分隔，每页独立提取图片和 Markdown 结构
+
+    也支持 PDF 文件: 传入 .pdf 文件路径，服务端自动转换为多图后推理。
 
     单 GPU 串行执行，同一时间只处理一个请求。
-    Unlimited-OCR 使用 gundam 模式（base_size=1024, image_size=640, crop_mode=True）
-    进行推理，内置 ref/det 标签解析和图片提取。
     """
+    import io as _io
+
     temps = []
     try:
-        # 解析请求消息，提取 prompt 和图片
-        prompt, img, temps = extract_messages(req.messages)
-        if not img:
+        # ── 第1步：解析消息，提取所有图片路径 ──
+        prompt, imgs, temps = extract_messages(req.messages)
+        if not imgs:
             return error_response(400, "消息中未找到图片", "invalid_request")
 
-        # 按需加载模型并更新使用时间
+        # 自动检测 PDF 文件并转换为图片
+        # 支持: 本地 .pdf 文件路径、data:application/pdf base64 编码
+        is_pdf = imgs[0].lower().endswith('.pdf')
+        if is_pdf:
+            import fitz  # PyMuPDF
+            pdf_path = imgs[0]
+            pdf_dpi = 300
+            pdf_tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
+            mat = fitz.Matrix(pdf_dpi / 72, pdf_dpi / 72)
+            pdf_imgs = []
+            doc = fitz.open(pdf_path)
+            for i, page in enumerate(doc):
+                out = os.path.join(pdf_tmp_dir, f"page_{i + 1:04d}.png")
+                page.get_pixmap(matrix=mat).save(out)
+                pdf_imgs.append(out)
+            doc.close()
+            # 替换: 用转换后的图片列表替代原 PDF 路径
+            temps.append(pdf_tmp_dir)  # 清理时会删除
+            imgs = pdf_imgs
+            if "Multi page" not in prompt:
+                prompt = "<image>\nMulti page parsing."
+
+        # ── 第2步：按需加载模型 ──
         _ensure_loaded()
         _touch_used()
 
         req_id = uuid.uuid4().hex[:12]
 
-        # 保存原图副本用于后处理裁剪
-        orig_copy = IMAGES_DIR / req_id / "_original.png"
-        orig_copy.parent.mkdir(parents=True, exist_ok=True)
-        from PIL import Image as PILImage
-        PILImage.open(img).save(str(orig_copy))
-
         with _infer_lock:
             if _model is None:
                 return error_response(503, "模型未加载", "server_error")
 
-            # 使用 eval_mode=True 获取含 <|det|> 标签的 raw 文本
-            # gundam 模式: base_size=1024, image_size=640, crop_mode=True
-            raw_text = _model.infer(
-                _tokenizer,
-                prompt=prompt,
-                image_file=img,
-                output_path='/tmp/unused',   # eval_mode 下不写入文件
-                base_size=1024,
-                image_size=640,
-                crop_mode=True,
-                max_length=32768,
-                no_repeat_ngram_size=35,
-                ngram_window=128,
-                save_results=False,
-                eval_mode=True,              # 关键: 返回 raw 文本而非处理后的结果
-            )
+            if len(imgs) == 1:
+                # ═══════════════════════════════════════════════════════
+                # 单图模式: model.infer() + eval_mode=True
+                # 参数: gundam 模式, crop_mode=True, image_size=640
+                # ═══════════════════════════════════════════════════════
+                orig_copy = IMAGES_DIR / req_id / "_original.png"
+                orig_copy.parent.mkdir(parents=True, exist_ok=True)
+                from PIL import Image as PILImage
+                PILImage.open(imgs[0]).save(str(orig_copy))
 
-        # 后处理：解析 det 标签 → Markdown 标题 + 图片提取
-        text = process_raw_output(raw_text, str(orig_copy), req_id) or "[empty]"
+                raw_text = _model.infer(
+                    _tokenizer,
+                    prompt=prompt,
+                    image_file=imgs[0],
+                    output_path='/tmp/unused',
+                    base_size=1024,
+                    image_size=640,
+                    crop_mode=True,
+                    max_length=32768,
+                    no_repeat_ngram_size=35,
+                    ngram_window=128,
+                    save_results=False,
+                    eval_mode=True,
+                )
+                text = process_raw_output(raw_text, str(orig_copy), req_id) or "[empty]"
+
+            else:
+                # ═══════════════════════════════════════════════════════
+                # 多图模式: model.infer_multi() + save_results=False
+                # 参数: base 模式, image_size=1024, 不支持 crop_mode
+                # 输出: 页间用 <PAGE> 分隔，每页含自己的 det 标签
+                # ═══════════════════════════════════════════════════════
+                # 重定向 stdout（infer_multi 内部使用 TPSTextStreamer 打印进度）
+                old_stdout = sys.stdout
+                sys.stdout = _io.StringIO()
+                try:
+                    raw_output, _ = _model.infer_multi(
+                        _tokenizer,
+                        prompt=prompt,
+                        image_files=imgs,
+                        output_path='/tmp/unused',
+                        image_size=1024,
+                        max_length=32768,
+                        no_repeat_ngram_size=35,
+                        ngram_window=1024,
+                        save_results=False,
+                    )
+                finally:
+                    sys.stdout = old_stdout
+
+                # ── 按 <PAGE> 分割每页输出 ──
+                # infer_multi 返回格式: "<PAGE>\npage1\n<PAGE>\npage2\n..."
+                pages = raw_output.split('<PAGE>')[1:]  # 跳过第一个空段
+                processed_pages = []
+
+                for page_idx, page_raw in enumerate(pages):
+                    page_raw = page_raw.strip()
+                    if not page_raw:
+                        continue
+
+                    if page_idx < len(imgs):
+                        # 保存该页原图用于裁剪
+                        page_copy = IMAGES_DIR / req_id / f"_page_{page_idx}.png"
+                        page_copy.parent.mkdir(parents=True, exist_ok=True)
+                        from PIL import Image as PILImage
+                        PILImage.open(imgs[page_idx]).save(str(page_copy))
+
+                        # 处理该页的 det 标签 → Markdown + 图片提取
+                        page_md = process_raw_output(
+                            page_raw, str(page_copy), f"{req_id}/page_{page_idx}"
+                        )
+                        if page_md and page_md != "[empty]":
+                            processed_pages.append(page_md)
+                    else:
+                        # 超出图片数量范围的页（极少情况），直接保留原始文本
+                        if page_raw:
+                            processed_pages.append(page_raw)
+
+                # 用页分隔符合并
+                text = "\n\n---\n\n".join(processed_pages) if processed_pages else "[empty]"
 
         obj_id = f"chatcmpl-{req_id}"
 
-        # 流式输出：SSE (Server-Sent Events)
+        # ── 流式输出 ──
         if req.stream:
             async def gen():
                 for chunk in text.split():
@@ -735,7 +830,10 @@ async def chat_completions(req: ChatCompletionRequest):
         # 清理临时图片文件
         for p in temps:
             try:
-                Path(p).unlink(missing_ok=True)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    Path(p).unlink(missing_ok=True)
             except Exception:
                 pass
 
