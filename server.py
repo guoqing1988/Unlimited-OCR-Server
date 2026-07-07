@@ -284,8 +284,17 @@ class ChatCompletionRequest(BaseModel):
 # 工具函数：消息解析、图片处理、输出后处理
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 模型提取的图片文件扩展名
-IMAGE_EXT = {"jpg", "jpeg", "png", "webp", "bmp"}
+# 模型输出的 det 标签类型到 Markdown 标题层级的映射
+# 键: det 类型名, 值: (Markdown 前缀, 是否保留标签后的文本)
+DET_TYPE_MAP = {
+    "header":       ("# ", True),      # 一级标题
+    "title":        ("## ", True),     # 二级标题
+    "subtitle":     ("### ", True),    # 三级标题
+    "text":         ("", True),        # 正文段落
+    "image":        ("", False),       # 图片（只裁剪，不输出文本）
+    "page_number":  ("", False),       # 页码（跳过）
+    "footer":       ("", False),       # 页脚（跳过）
+}
 
 # 模型输出的文本文件扩展名
 TEXT_EXT = {".mmd", ".md", ".txt", ".json", ".xml", ".html"}
@@ -370,59 +379,137 @@ def extract_messages(messages: list[Message]) -> tuple[str, str | None, list[str
     return prompt, img, temps
 
 
-def save_output_and_images(out_dir: str, req_id: str) -> str:
+def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> str:
     """
-    处理模型输出:
+    将模型 raw 输出（含 <|det|> 标签）处理为完整 Markdown。
 
-    1. 将提取的图片从临时目录复制到 IMAGES_DIR/{req_id}/
-    2. 读取文本输出文件（result.md 等）
-    3. 将嵌入的图片路径从 images/N.jpg 改写为 images/{req_id}/N.jpg
-    4. 为空 alt 的图片自动补充描述（用前面最近的 ## 标题）
+    处理管线:
+    1. 去除 EOS 标记
+    2. 按行解析 <|det|>类型 [坐标]<|/det|> 标签
+    3. 类型映射到 Markdown 格式：
+       header   → # 标题
+       title    → ## 标题
+       subtitle → ### 标题
+       text     → 纯文本段落
+       image    → 从原图裁剪保存，替换为 ![](images/{req_id}/N.jpg)
+       page_number → 跳过
+    4. 为图片自动生成 alt 文本（向前搜索最近的标题）
+    5. 清理残留标记
 
-    返回合并后的 Markdown 文本。
+    返回:
+        格式化后的 Markdown 字符串。
     """
-    # 持久化提取的图片
-    dest = IMAGES_DIR / req_id
-    dest.mkdir(parents=True, exist_ok=True)
+    from PIL import Image as PILImage
 
-    for f in Path(out_dir).glob("images/*"):
-        if f.is_file():
-            shutil.copy2(f, dest / f.name)
+    # 去除 EOS 标记
+    stop_str = '<｜end▁of▁sentence｜>'
+    if raw_text.endswith(stop_str):
+        raw_text = raw_text[:-len(stop_str)]
+    raw_text = raw_text.strip()
 
-    # 读取文本输出，替换 Markdown 中的图片路径
-    results = []
-    for f in sorted(Path(out_dir).glob("**/*")):
-        if f.is_file() and f.suffix.lower() in TEXT_EXT:
-            text = f.read_text()
+    # 加载原图用于裁剪
+    try:
+        orig_img = PILImage.open(original_image_path)
+        img_w, img_h = orig_img.size
+    except Exception:
+        orig_img = None
+        img_w, img_h = 1, 1
 
-            # 为空 alt 的图片补充描述：用前面最近的 ## 标题作为 alt
-            def fill_alt(m):
-                prefix = m.group(1)
-                img_tag = m.group(2)
-                # 找前面最近的 ## 标题
-                headings = re.findall(r"^##\s*(.+)", prefix, re.MULTILINE)
-                if headings:
-                    alt = headings[-1].strip()
+    # 准备图片输出目录
+    img_dir = IMAGES_DIR / req_id
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    # det 标签正则：匹配 <|det|>类型 [坐标]<|/det|> 格式的行
+    det_pattern = re.compile(
+        r'<\|det\|>\s*([A-Za-z_][\w-]*)\s*(\[[^\]]+\])\s*<\|/det\|>'
+    )
+
+    lines = raw_text.split('\n')
+    result_lines = []         # 最终输出的 Markdown 行
+    last_heading = ""         # 记录最近的标题，用于生成图片 alt
+    image_idx = 0             # 图片序号
+
+    for line in lines:
+        m = det_pattern.search(line)
+
+        if not m:
+            # 没有 det 标签的行 → 原样保留
+            line_clean = line.strip()
+            if line_clean:
+                result_lines.append(line_clean)
+            continue
+
+        det_type = m.group(1).strip()
+        coords_str = m.group(2)
+
+        # 提取标签后面的文本内容
+        text_after = line[m.end():].strip()
+
+        # 查找该类型在映射表中的配置
+        mapping = DET_TYPE_MAP.get(det_type)
+        if mapping is None:
+            # 未知类型 → 只保留文本
+            if text_after:
+                result_lines.append(text_after)
+            continue
+
+        prefix, keep_text = mapping
+
+        if det_type == "image":
+            # ── 图片处理：从原图裁剪 ──
+            try:
+                coords = eval(coords_str)
+                if coords and isinstance(coords[0], (int, float)):
+                    coords = [coords]
+            except Exception:
+                coords = []
+
+            for ci, c in enumerate(coords):
+                try:
+                    x1 = int(c[0] / 999 * img_w)
+                    y1 = int(c[1] / 999 * img_h)
+                    x2 = int(c[2] / 999 * img_w)
+                    y2 = int(c[3] / 999 * img_h)
+
+                    if orig_img is not None and x2 > x1 and y2 > y1:
+                        cropped = orig_img.crop((x1, y1, x2, y2))
+                        suffix = f"_{ci}" if len(coords) > 1 else ""
+                        cropped.save(str(img_dir / f"{image_idx}{suffix}.jpg"))
+                except Exception:
+                    continue
+
+            # 生成 alt 文本
+            alt = last_heading if last_heading else "image"
+
+            # 构建 Markdown 图片引用
+            if len(coords) == 1:
+                result_lines.append(f"![{alt}](images/{req_id}/{image_idx}.jpg)")
+            else:
+                for ci in range(len(coords)):
+                    result_lines.append(
+                        f"![{alt} ({ci+1})](images/{req_id}/{image_idx}_{ci}.jpg)"
+                    )
+
+            image_idx += 1
+
+        elif keep_text:
+            # ── 文本类型：添加 Markdown 前缀 ──
+            md_line = f"{prefix}{text_after}" if text_after else ""
+            if md_line:
+                # 记录标题用于后续图片 alt
+                if det_type in ("header", "title", "subtitle"):
+                    last_heading = text_after if text_after else last_heading
+                    result_lines.append("")     # 标题前空一行
+                    result_lines.append(md_line)
                 else:
-                    last_text = re.sub(r"\s+", " ", prefix).strip()
-                    alt = last_text[-40:].strip() if last_text else "image"
-                # 保留前缀内容，只替换图片标签
-                return f"{prefix}![{alt}]({img_tag})"
+                    result_lines.append(md_line)
 
-            text = re.sub(
-                r"(?s)(.*?)!\[\]\((images/\d+\.(?:jpg|png|jpeg|webp|bmp))\)",
-                fill_alt,
-                text,
-            )
+        # det_type 为非 image 且 keep_text=False（如 page_number）→ 跳过
 
-            # 将临时路径替换为持久化路径
-            text = re.sub(
-                r"images/(\d+\.(jpg|png|jpeg|webp|bmp))",
-                f"images/{req_id}/\\1",
-                text,
-            )
-            results.append(text)
-    return "\n\n".join(results) if results else ""
+    # 清理残留的 LaTeX 转义
+    result = '\n'.join(result_lines).replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
+
+    return result.strip()
 
 
 def make_chunk(obj_id: str, model: str, delta: dict, finish: str | None = None) -> dict:
@@ -536,28 +623,35 @@ async def chat_completions(req: ChatCompletionRequest):
 
         req_id = uuid.uuid4().hex[:12]
 
+        # 保存原图副本用于后处理裁剪
+        orig_copy = IMAGES_DIR / req_id / "_original.png"
+        orig_copy.parent.mkdir(parents=True, exist_ok=True)
+        from PIL import Image as PILImage
+        PILImage.open(img).save(str(orig_copy))
+
         with _infer_lock:
             if _model is None:
                 return error_response(503, "模型未加载", "server_error")
 
-            # 在临时目录中执行推理
-            # 使用 gundam 模式：base_size=1024（全局视图），image_size=640（切片分辨率）
-            # crop_mode=True 启用动态分块，适合复杂排版的文档
-            with tempfile.TemporaryDirectory() as out_dir:
-                _model.infer(
-                    _tokenizer,
-                    prompt=prompt,
-                    image_file=img,
-                    output_path=out_dir,
-                    base_size=1024,         # 全局视图分辨率
-                    image_size=640,         # 切片裁剪分辨率（gundam 模式）
-                    crop_mode=True,         # 动态分块，适应复杂排版
-                    max_length=32768,       # 最大输出 token 数
-                    no_repeat_ngram_size=35,# 防止 ngram 重复的窗口大小
-                    ngram_window=128,       # 滑动窗口大小
-                    save_results=True,      # 将文本和图片保存到 out_dir
-                )
-                text = save_output_and_images(out_dir, req_id) or "[empty]"
+            # 使用 eval_mode=True 获取含 <|det|> 标签的 raw 文本
+            # gundam 模式: base_size=1024, image_size=640, crop_mode=True
+            raw_text = _model.infer(
+                _tokenizer,
+                prompt=prompt,
+                image_file=img,
+                output_path='/tmp/unused',   # eval_mode 下不写入文件
+                base_size=1024,
+                image_size=640,
+                crop_mode=True,
+                max_length=32768,
+                no_repeat_ngram_size=35,
+                ngram_window=128,
+                save_results=False,
+                eval_mode=True,              # 关键: 返回 raw 文本而非处理后的结果
+            )
+
+        # 后处理：解析 det 标签 → Markdown 标题 + 图片提取
+        text = process_raw_output(raw_text, str(orig_copy), req_id) or "[empty]"
 
         obj_id = f"chatcmpl-{req_id}"
 
