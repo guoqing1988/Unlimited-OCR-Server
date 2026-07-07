@@ -467,7 +467,17 @@ PORT=9705
 API_KEY=                    # 留空不校验
 IDLE_UNLOAD_SECONDS=900     # 空闲超时(秒)
 WATCHDOG_POLL_SECONDS=10    # 看门狗间隔(秒)
+MAX_PAGES_PER_BATCH=20      # 每批最多处理页数（防OOM）
 ```
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL_PATH` | `/data/www/models/Unlimited-OCR` | 模型路径 |
+| `PORT` | `10000` | 服务端口 |
+| `API_KEY` | 空 | API 认证密钥 |
+| `IDLE_UNLOAD_SECONDS` | `900` | 空闲卸载超时(秒) |
+| `WATCHDOG_POLL_SECONDS` | `10` | 看门狗检查间隔 |
+| `MAX_PAGES_PER_BATCH` | `20` | PDF 每批最多页数 |
 
 ---
 

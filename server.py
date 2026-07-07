@@ -70,6 +70,10 @@ IDLE_UNLOAD_SECONDS = int(os.environ.get("IDLE_UNLOAD_SECONDS", "900"))
 # 看门狗检查间隔（秒）
 WATCHDOG_POLL_SECONDS = int(os.environ.get("WATCHDOG_POLL_SECONDS", "10"))
 
+# PDF/多图分批处理：每批最多处理多少页
+# 20页 × 257 token/页 ≈ 5140 image tokens，留足文本输出空间，避免 OOM
+MAX_PAGES_PER_BATCH = int(os.environ.get("MAX_PAGES_PER_BATCH", "20"))
+
 # OCR 过程中提取的图片存放目录，按请求 ID 分子目录
 IMAGES_DIR = Path(__file__).parent / "images"
 
@@ -788,58 +792,58 @@ async def chat_completions(req: ChatCompletionRequest):
 
             else:
                 # ═══════════════════════════════════════════════════════
-                # 多图模式: model.infer_multi() + save_results=False
-                # 参数: base 模式, image_size=1024, 不支持 crop_mode
-                # 输出: 页间用 <PAGE> 分隔，每页含自己的 det 标签
+                # 多图模式: 自动分批处理，每批 ≤ MAX_PAGES_PER_BATCH 页
+                # 每批独立调用 infer_multi()，结果用 --- 合并
                 # ═══════════════════════════════════════════════════════
-                # 重定向 stdout（infer_multi 内部使用 TPSTextStreamer 打印进度）
-                old_stdout = sys.stdout
-                sys.stdout = _io.StringIO()
-                try:
-                    raw_output, _ = _model.infer_multi(
-                        _tokenizer,
-                        prompt=prompt,
-                        image_files=imgs,
-                        output_path='/tmp/unused',
-                        image_size=1024,
-                        max_length=32768,
-                        no_repeat_ngram_size=35,
-                        ngram_window=1024,
-                        save_results=False,
-                    )
-                finally:
-                    sys.stdout = old_stdout
+                total_pages = len(imgs)
+                batch_size = MAX_PAGES_PER_BATCH
+                all_processed = []
+                global_page_idx = 0  # 跨批次的全局页码
 
-                # ── 按 <PAGE> 分割每页输出 ──
-                # infer_multi 返回格式: "<PAGE>\npage1\n<PAGE>\npage2\n..."
-                pages = raw_output.split('<PAGE>')[1:]  # 跳过第一个空段
-                processed_pages = []
+                for batch_start in range(0, total_pages, batch_size):
+                    batch_end = min(batch_start + batch_size, total_pages)
+                    batch_imgs = imgs[batch_start:batch_end]
 
-                for page_idx, page_raw in enumerate(pages):
-                    page_raw = page_raw.strip()
-                    if not page_raw:
-                        continue
-
-                    if page_idx < len(imgs):
-                        # 保存该页原图用于裁剪
-                        page_copy = IMAGES_DIR / req_id / f"_page_{page_idx}.png"
-                        page_copy.parent.mkdir(parents=True, exist_ok=True)
-                        from PIL import Image as PILImage
-                        PILImage.open(imgs[page_idx]).save(str(page_copy))
-
-                        # 处理该页的 det 标签 → Markdown + 图片提取
-                        page_md = process_raw_output(
-                            page_raw, str(page_copy), f"{req_id}/page_{page_idx}"
+                    # 重定向 stdout（infer_multi 内部使用 TPSTextStreamer）
+                    old_stdout = sys.stdout
+                    sys.stdout = _io.StringIO()
+                    try:
+                        raw_output, _ = _model.infer_multi(
+                            _tokenizer,
+                            prompt=prompt,
+                            image_files=batch_imgs,
+                            output_path='/tmp/unused',
+                            image_size=1024,
+                            max_length=32768,
+                            no_repeat_ngram_size=35,
+                            ngram_window=1024,
+                            save_results=False,
                         )
-                        if page_md and page_md != "[empty]":
-                            processed_pages.append(page_md)
-                    else:
-                        # 超出图片数量范围的页（极少情况），直接保留原始文本
-                        if page_raw:
-                            processed_pages.append(page_raw)
+                    finally:
+                        sys.stdout = old_stdout
 
-                # 用页分隔符合并
-                text = "\n\n---\n\n".join(processed_pages) if processed_pages else "[empty]"
+                    # 按 <PAGE> 分割每页输出
+                    pages = raw_output.split('<PAGE>')[1:]
+                    for page_raw in pages:
+                        page_raw = page_raw.strip()
+                        if not page_raw:
+                            continue
+
+                        if global_page_idx < total_pages:
+                            page_copy = IMAGES_DIR / req_id / f"_page_{global_page_idx}.png"
+                            page_copy.parent.mkdir(parents=True, exist_ok=True)
+                            from PIL import Image as PILImage
+                            PILImage.open(imgs[global_page_idx]).save(str(page_copy))
+
+                            page_md = process_raw_output(
+                                page_raw, str(page_copy), f"{req_id}/page_{global_page_idx}"
+                            )
+                            if page_md and page_md != "[empty]":
+                                all_processed.append(page_md)
+
+                        global_page_idx += 1
+
+                text = "\n\n---\n\n".join(all_processed) if all_processed else "[empty]"
 
         obj_id = f"chatcmpl-{req_id}"
 
