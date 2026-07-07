@@ -141,6 +141,160 @@ resp = requests.post(
 
 ---
 
+## 完整请求示例
+
+### cURL（单图 base64）
+
+```bash
+curl -s http://localhost:9705/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-key" \
+  -d '{
+    "model": "Unlimited-OCR",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "<image>\nFree OCR."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      ]
+    }],
+    "max_tokens": 4096
+  }' | python3 -m json.tool
+```
+
+### Python（OpenAI SDK，单图）
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9705/v1",
+    api_key="your-key",
+)
+
+with open("document.jpg", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+response = client.chat.completions.create(
+    model="Unlimited-OCR",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "<image>\nFree OCR."},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}"
+            }},
+        ],
+    }],
+    max_tokens=4096,
+)
+print(response.choices[0].message.content)
+
+# 流式输出
+response = client.chat.completions.create(
+    model="Unlimited-OCR",
+    messages=[...],
+    stream=True,
+)
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+### Python（requests，单图）
+
+```python
+import base64, json, requests
+
+with open("document.jpg", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+resp = requests.post(
+    "http://localhost:9705/v1/chat/completions",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer your-key",
+    },
+    json={
+        "model": "Unlimited-OCR",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<image>\nFree OCR."},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}"
+                }},
+            ],
+        }],
+        "max_tokens": 4096,
+    },
+    timeout=300,
+)
+resp.raise_for_status()
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+### Python（本地绝对路径，PDF）
+
+```python
+import json, requests
+
+resp = requests.post(
+    "http://localhost:9705/v1/chat/completions",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer your-key",
+    },
+    json={
+        "model": "Unlimited-OCR",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<image>\nMulti page parsing."},
+                {"type": "image_url", "image_url": {
+                    "url": "/data/www/docs/report.pdf"
+                }},
+            ],
+        }],
+        "max_tokens": 32768,
+    },
+    timeout=1200,
+)
+resp.raise_for_status()
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+### Python（HTTP URL，远程图片）
+
+```python
+import json, requests
+
+resp = requests.post(
+    "http://localhost:9705/v1/chat/completions",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer your-key",
+    },
+    json={
+        "model": "Unlimited-OCR",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<image>\nFree OCR."},
+                {"type": "image_url", "image_url": {
+                    "url": "https://cdn.example.com/page.jpg"
+                }},
+            ],
+        }],
+        "max_tokens": 4096,
+    },
+    timeout=300,
+)
+```
+
+---
+
 ## 多图/PDF 输出格式
 
 多图或 PDF 推理时，输出页间用 `---` 分隔，每页独立提取图片：
