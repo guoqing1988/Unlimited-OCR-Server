@@ -462,52 +462,54 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     )
 
     # ── 第5步：逐行解析并构建 Markdown ──
+    # 空行插入策略（只在类型变化时加空行）：
+    #   文本段 → 文本段：不加空行（合并为同一段落）
+    #   文本段 → 标题/图片：加空行
+    #   图片 → 图片：不加空行（连续图片在一起）
+    #   图片 → 文本/标题：加空行
+    #   标题 → 任何：标题自身是块元素，渲染自然分隔
     lines = raw_text.split('\n')
     result_lines = []         # 最终输出的 Markdown 行列表
     last_heading = ""         # 记录最近遇到的标题文本，作为后续图片的 alt
     image_idx = 0             # 图片序号，用于文件命名（N.jpg）
+    prev_type = ""            # 上一行的 det 类型
 
     for line in lines:
-        # 在当前行中搜索 det 标签
         m = det_pattern.search(line)
 
         if not m:
-            # ── 无 det 标签的行：直接保留文本内容 ──
-            # 例如第一行 "Text: \"Free Speech & Data\"" 没有标签
+            # ── 无 det 标签的行：视为 text ──
             line_clean = line.strip()
             if line_clean:
+                # 类型变化时加空行分隔（但 text→text 不需要）
+                if prev_type not in ("", "text"):
+                    result_lines.append("")
                 result_lines.append(line_clean)
-                # 文本段落后插入空行，确保 Markdown 渲染时与后续内容分隔
-                result_lines.append("")
+                prev_type = "text"
             continue
 
         # ── 解析 det 标签 ──
-        # 示例: "<|det|>title [28, 381, 215, 399]<|/det|>[Fiskars] 芬蘭釵剪"
-        #   → det_type = "title"
-        #   → coords_str = "[28, 381, 215, 399]"
-        #   → text_after = "[Fiskars] 芬蘭釵剪"
-        det_type = m.group(1).strip()      # 区域类型（header/title/text/image/page_number）
-        coords_str = m.group(2)            # 坐标字符串（如 "[27,26,252,37]"）
-
-        # 标签后面的文本是实际内容（标题文本、正文、产品名等）
+        det_type = m.group(1).strip()
+        coords_str = m.group(2)
         text_after = line[m.end():].strip()
 
-        # ── 查找该类型在映射表中的配置 ──
-        # DET_TYPE_MAP 定义了每种类型如何转换为 Markdown
-        # 例如: "title" → ("## ", True)  表示使用 ## 前缀且保留文本
         mapping = DET_TYPE_MAP.get(det_type)
         if mapping is None:
-            # 未知类型（模型可能输出新的标签类型）→ 只保留文本内容
+            # 未知类型 → 视为 text
             if text_after:
+                if prev_type not in ("", "text"):
+                    result_lines.append("")
                 result_lines.append(text_after)
+                prev_type = "text"
             continue
 
         prefix, keep_text = mapping
 
-        # ── 图片类型：特殊处理 ──
         if det_type == "image":
-            # 解析坐标字符串为 Python 列表
-            # 格式可能是 "[x1,y1,x2,y2]" 或 "[[x1,y1,x2,y2], [x1,y1,x2,y2], ...]"
+            # ── 图片处理 ──
+            # 类型变化时加空行（image→image 不加）
+            if prev_type not in ("", "image"):
+                result_lines.append("")
             try:
                 coords = eval(coords_str)
                 # 如果是单个坐标组 [100, 50, 300, 200]，包装为 [[100, 50, 300, 200]]
@@ -556,28 +558,26 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                         f"![{alt} ({ci+1})](images/{req_id}/{image_idx}_{ci}.jpg)"
                     )
 
-            image_idx += 1  # 图片序号递增
-
-            # 图片后插入空行，与后续段落分隔
-            result_lines.append("")
+            image_idx += 1
+            prev_type = "image"
 
         elif keep_text:
-            # ── 文本类型：添加 Markdown 标题前缀 ──
-            # header  → "# CITYMAGAZINE / JUL 2009 / SPY"
-            # title   → "## [Fiskars] 芬蘭釵剪"
-            # text    → "Jenny: 我最鍾意北歐設計刀具..."
+            # ── 文本/标题类型 ──
             md_line = f"{prefix}{text_after}" if text_after else ""
             if md_line:
-                # 记录标题文本，后续图片将使用此文本作为 alt
                 if det_type in ("header", "title", "subtitle"):
                     last_heading = text_after if text_after else last_heading
-                    result_lines.append("")     # 标题前插入空行，符合 Markdown 规范
+                    # 标题前加空行（与上文分隔，标题→标题除外）
+                    if prev_type not in ("", "header", "title", "subtitle"):
+                        result_lines.append("")
                     result_lines.append(md_line)
+                    prev_type = det_type
                 else:
-                    # 普通文本段落，不加前缀直接输出
+                    # 正文段落：text→text 合并不加空行
+                    if prev_type not in ("", "text"):
+                        result_lines.append("")
                     result_lines.append(md_line)
-                    # 段落后插入空行，确保 Markdown 渲染时与后续的标题/图片分隔
-                    result_lines.append("")
+                    prev_type = "text"
 
         # 注意：det_type 为非 image 且 keep_text=False 的情况（如 page_number）
         # 直接跳过，不输出任何内容
