@@ -313,16 +313,65 @@ resp = requests.post(
 
 每页图片保存在 `images/{req_id}/page_{页码}/`。
 
+### 多图模式选项
+
+服务支持两种多图推理模式，通过 `page_mode` 参数控制：
+
+| 选项 | 方法 | image_size | 速度 | 质量 | 跨页上下文 | 适用场景 |
+|------|------|:---:|:---:|:---:|:---:|------|
+| `batch`（默认） | infer_multi | 1024 | 基准 | 2513字/2页 | ✅ | 跨页表格、连续文章 |
+| `single` | infer (gundam) | 640 | 快13% | +44%字数 | ❌ | 独立页面、追求质量 |
+
+#### `max_pages` — 限制处理页数
+
+```python
+# 只处理前5页（适合预览或限制 token 消耗）
+{"model": "Unlimited-OCR", "max_pages": 5, "messages": [...]}
+
+# 不限制（默认，处理全部页面）
+{"model": "Unlimited-OCR", "messages": [...]}
+```
+
+#### `page_mode` — 选择推理策略
+
+```python
+# 批量模式（默认）— 跨页上下文连贯
+{"model": "Unlimited-OCR", "page_mode": "batch", "messages": [...]}
+
+# 逐张模式 — 每页独立推理，gundam 640 高质量
+{"model": "Unlimited-OCR", "page_mode": "single", "messages": [...]}
+```
+
+#### 完整示例：100页PDF，只处理前10页，逐张高质量
+
+```python
+resp = requests.post(
+    "http://localhost:9705/v1/chat/completions",
+    headers={"Content-Type": "application/json", "Authorization": "Bearer key"},
+    json={
+        "model": "Unlimited-OCR",
+        "max_pages": 10,
+        "page_mode": "single",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "<image>\nFree OCR."},
+            {"type": "image_url", "image_url": {"url": "/data/large-report.pdf"}},
+        ]}],
+        "max_tokens": 32768,
+    },
+    timeout=600,
+)
+```
+
 ### 推理参数
 
-| 参数 | 单图 | 多图/PDF |
-|------|------|----------|
-| 推理方法 | `model.infer()` | `model.infer_multi()` |
-| image_size | 640 | 1024 |
-| 动态分块 | ✅ (gundam) | ❌ (base) |
-| ngram_window | 128 | 1024 |
-| PDF DPI | — | 300 |
-| 超时建议 | 300s | 600-1200s |
+| 参数 | 单图 | 多图 batch | 多图 single |
+|------|------|------------|-------------|
+| 推理方法 | `model.infer()` | `model.infer_multi()` | `model.infer()` 循环 |
+| image_size | 640 | 1024 | 640 |
+| 动态分块 | ✅ (gundam) | ❌ (base) | ✅ (gundam) |
+| ngram_window | 128 | 1024 | 128 |
+| PDF DPI | — | 300 | 300 |
+| 超时建议 | 300s | 600-1200s | 300s/页 |
 
 ---
 
