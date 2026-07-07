@@ -29,6 +29,10 @@ htmlcov/
 outputs/
 log/
 *.log
+images/
+
+# Environment (contains secrets)
+.env
 
 # OS and editor files
 .DS_Store
