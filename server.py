@@ -27,7 +27,17 @@ import traceback
 import shutil
 import re
 import warnings
+import logging
 from pathlib import Path
+
+# ── 日志 ─────────────────────────────────────────────────────────
+# 统一使用 logging 输出到 stdout/stderr（systemd journald 可见）
+logger = logging.getLogger("unlimited-ocr")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 from typing import Optional
 
 # 屏蔽 Transformers generate() 内部关于 attention_mask/pad_token_id 的冗余警告
@@ -465,8 +475,12 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     try:
         orig_img = PILImage.open(original_image_path)
         img_w, img_h = orig_img.size
-    except Exception:
+    except Exception as e:
         # 如果原图加载失败，后面裁剪会跳过，但不阻塞 Markdown 文本生成
+        logger.warning(
+            "裁剪源图片打开失败: %s 异常=%s: %s",
+            original_image_path, type(e).__name__, e,
+        )
         orig_img = None
         img_w, img_h = 1, 1
 
@@ -552,8 +566,12 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                 # 如果是单个坐标组 [100, 50, 300, 200]，包装为 [[100, 50, 300, 200]]
                 if coords and isinstance(coords[0], (int, float)):
                     coords = [coords]
-            except Exception:
+            except Exception as e:
                 # 坐标解析失败（格式异常），跳过此图片
+                logger.warning(
+                    "图片坐标解析失败: req_id=%s 坐标=%s 异常=%s: %s",
+                    req_id, coords_str, type(e).__name__, e,
+                )
                 coords = []
 
             # 记录实际保存成功的子图文件名（裁剪失败的图片不会生成链接）
@@ -561,6 +579,7 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
 
             # 遍历可能的多组坐标（一个 image 区域可能包含多张子图）
             for ci, c in enumerate(coords):
+                fname = f"{image_idx}{('_' + str(ci)) if len(coords) > 1 else ''}.jpg"
                 try:
                     # 将 [0,999] 归一化坐标映射到实际像素坐标
                     # 公式：像素坐标 = 归一化坐标 / 999 × 实际尺寸
@@ -574,16 +593,32 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                         cropped = orig_img.crop((x1, y1, x2, y2))
                         # 多图时加 _ci 后缀区分：0_0.jpg, 0_1.jpg
                         suffix = f"_{ci}" if len(coords) > 1 else ""
-                        fname = f"{image_idx}{suffix}.jpg"
                         cropped.save(str(img_dir / fname))
                         saved_files.append(fname)
-                except Exception:
-                    # 单张图片裁剪失败不影响其他图片
+                    else:
+                        # 坐标无效或原图缺失：记录原因，便于排查"无图/死链"问题
+                        logger.warning(
+                            "图片裁剪跳过: req_id=%s 文件=%s 坐标=%s 原图=%s 原因=%s",
+                            req_id, fname, c,
+                            "已加载" if orig_img is not None else "缺失",
+                            "坐标无效(x2<=x1 或 y2<=y1)" if x2 <= x1 or y2 <= y1 else "未知",
+                        )
+                except Exception as e:
+                    # 单张图片裁剪失败不影响其他图片，但必须记录，便于排查
+                    logger.warning(
+                        "图片裁剪异常: req_id=%s 文件=%s 坐标=%s 原图=%s 异常=%s: %s",
+                        req_id, fname, c, original_image_path, type(e).__name__, e,
+                    )
                     continue
 
             # 只有实际保存成功的图片才生成 Markdown 链接；
             # 若该 image 标签的所有子图均裁剪失败，则不输出任何图片（避免死链 404）
             if not saved_files:
+                # 汇总日志：整条 image 标签无任何子图产出
+                logger.warning(
+                    "图片裁剪全部失败，跳过输出: req_id=%s 坐标=%s",
+                    req_id, coords_str,
+                )
                 continue
 
             # ── 生成 alt 文本 ──
@@ -806,6 +841,15 @@ async def chat_completions(req: ChatCompletionRequest):
                     orig_copy.parent.mkdir(parents=True, exist_ok=True)
                     from PIL import Image as PILImage
                     PILImage.open(img_path).save(str(orig_copy))
+                    # 立即验证副本可完整读取：副本损坏会导致后续裁剪失败（静默丢图）
+                    try:
+                        _verify = PILImage.open(orig_copy)
+                        _verify.load()
+                    except Exception as _e:
+                        logger.error(
+                            "裁剪源副本损坏: req_id=%s page=%d 文件=%s 异常=%s: %s",
+                            req_id, page_idx, orig_copy, type(_e).__name__, _e,
+                        )
 
                     raw_text = _model.infer(
                         _tokenizer,
@@ -867,6 +911,16 @@ async def chat_completions(req: ChatCompletionRequest):
                             page_copy.parent.mkdir(parents=True, exist_ok=True)
                             from PIL import Image as PILImage
                             PILImage.open(imgs[global_page_idx]).save(str(page_copy))
+                            # 立即验证副本可完整读取：副本损坏会导致后续裁剪失败（静默丢图）
+                            try:
+                                _verify = PILImage.open(page_copy)
+                                _verify.load()
+                            except Exception as _e:
+                                logger.error(
+                                    "裁剪源副本损坏: req_id=%s page=%d 文件=%s 异常=%s: %s",
+                                    req_id, global_page_idx, page_copy,
+                                    type(_e).__name__, _e,
+                                )
                             page_md = process_raw_output(
                                 page_raw, str(page_copy), f"{req_id}/page_{global_page_idx}"
                             )

@@ -101,6 +101,17 @@ def test_malformed_coords_no_link(tmp_path):
         not any((server.IMAGES_DIR / req_id).iterdir())
 
 
+def test_crop_failure_logged(caplog):
+    """裁剪失败必须记录 warning 日志（便于线上排查"无图"问题）。"""
+    img_path = _make_test_image(999, 999)
+    req_id = f"{TEST_PREFIX}logcheck"
+    with caplog.at_level("WARNING", logger="unlimited-ocr"):
+        # 坐标无效（x1==x2）→ 触发裁剪跳过日志
+        raw = "<|det|>image [200, 200, 200, 500]<|/det|>\n"
+        _run_process(raw, img_path, req_id)
+    assert any("图片裁剪" in r.message for r in caplog.records), caplog.text
+
+
 def test_after_failed_image_idx_continues(tmp_path):
     """失败的 image 不占用序号：后续成功的图片编号连续。"""
     img_path = _make_test_image(999, 999)
