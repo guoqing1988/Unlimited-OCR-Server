@@ -394,8 +394,11 @@ def extract_messages(messages: list[Message]) -> tuple[str, list[str], list[str]
                         tmp.close()
                         fpath = tmp.name
                     elif os.path.isfile(url):
-                        # 本地绝对路径
-                        fpath = url
+                        # 本地绝对路径：直接使用调用方的文件
+                        # 不加入 temps —— 服务端只清理自己产生的临时文件（base64 解码、
+                        # URL 下载），无权删除客户端/调用方的本地文件
+                        imgs.append(url)
+                        continue
                     if fpath:
                         temps.append(fpath)
                         imgs.append(fpath)
@@ -553,6 +556,9 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                 # 坐标解析失败（格式异常），跳过此图片
                 coords = []
 
+            # 记录实际保存成功的子图文件名（裁剪失败的图片不会生成链接）
+            saved_files: list[str] = []
+
             # 遍历可能的多组坐标（一个 image 区域可能包含多张子图）
             for ci, c in enumerate(coords):
                 try:
@@ -568,10 +574,17 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                         cropped = orig_img.crop((x1, y1, x2, y2))
                         # 多图时加 _ci 后缀区分：0_0.jpg, 0_1.jpg
                         suffix = f"_{ci}" if len(coords) > 1 else ""
-                        cropped.save(str(img_dir / f"{image_idx}{suffix}.jpg"))
+                        fname = f"{image_idx}{suffix}.jpg"
+                        cropped.save(str(img_dir / fname))
+                        saved_files.append(fname)
                 except Exception:
                     # 单张图片裁剪失败不影响其他图片
                     continue
+
+            # 只有实际保存成功的图片才生成 Markdown 链接；
+            # 若该 image 标签的所有子图均裁剪失败，则不输出任何图片（避免死链 404）
+            if not saved_files:
+                continue
 
             # ── 生成 alt 文本 ──
             # 策略：使用最近遇到的标题（由 header/title/subtitle 标签记录）
@@ -582,15 +595,11 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
             # 单图: ![标题文本](images/req_id/0.jpg)
             # 多图: ![标题文本 (1)](images/req_id/0_0.jpg)
             #       ![标题文本 (2)](images/req_id/0_1.jpg)
-            if len(coords) == 1:
-                result_lines.append(
-                    f"![{alt}](images/{req_id}/{image_idx}.jpg)"
-                )
-            else:
-                for ci in range(len(coords)):
-                    result_lines.append(
-                        f"![{alt} ({ci+1})](images/{req_id}/{image_idx}_{ci}.jpg)"
-                    )
+            for ci, fname in enumerate(saved_files):
+                if len(saved_files) == 1:
+                    result_lines.append(f"![{alt}](images/{req_id}/{fname})")
+                else:
+                    result_lines.append(f"![{alt} ({ci+1})](images/{req_id}/{fname})")
 
             image_idx += 1
             prev_type = "image"
