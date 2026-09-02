@@ -414,11 +414,14 @@ def extract_messages(messages: list[Message]) -> tuple[str, list[str], list[str]
                         imgs.append(fpath)
 
     # 组装 prompt
-    # 多图时使用 "Multi page parsing." 提示词，单图时使用 "Free OCR."
+    # 多图时使用 "Multi page parsing." 提示词，单图时使用 "document parsing."
+    # 注意：必须使用官方指令（README 示例），勿用 DeepSeek-OCR 的 "Free OCR." ——
+    # 模型对 "Free OCR." 指令困惑，会在输出开头重复大量 "Free"（直至 no_repeat_ngram 打断），
+    # 甚至偶发陷入生成循环（生成满 max_length 不停止），导致识别失败、耗时极长。
     if len(imgs) > 1:
-        default_prompt = "<image>\nMulti page parsing."
+        default_prompt = "<image>Multi page parsing."
     else:
-        default_prompt = "<image>\nFree OCR."
+        default_prompt = "<image>document parsing."
 
     prompt = "\n".join(parts) if parts else default_prompt
     if "<image>" not in prompt:
@@ -811,7 +814,7 @@ async def chat_completions(req: ChatCompletionRequest):
             temps.append(pdf_tmp_dir)  # 清理时会删除
             imgs = pdf_imgs
             if "Multi page" not in prompt:
-                prompt = "<image>\nMulti page parsing."
+                prompt = "<image>Multi page parsing."
 
         # ── 应用 max_pages 限制（仅对多图/PDF 生效） ──
         if req.max_pages is not None and req.max_pages > 0 and len(imgs) > req.max_pages:
@@ -859,9 +862,9 @@ async def chat_completions(req: ChatCompletionRequest):
                         base_size=1024,
                         image_size=640,
                         crop_mode=True,
-                        max_length=32768,
+                        max_length=8192,
                         no_repeat_ngram_size=35,
-                        ngram_window=128,
+                        ngram_window=1024,
                         save_results=False,
                         eval_mode=True,
                     )
@@ -893,7 +896,7 @@ async def chat_completions(req: ChatCompletionRequest):
                             image_files=batch_imgs,
                             output_path='/tmp/unused',
                             image_size=1024,
-                            max_length=32768,
+                            max_length=8192,
                             no_repeat_ngram_size=35,
                             ngram_window=1024,
                             save_results=False,
