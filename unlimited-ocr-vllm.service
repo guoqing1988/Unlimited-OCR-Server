@@ -1,0 +1,38 @@
+[Unit]
+Description=Unlimited-OCR API 服务 (vLLM FP8 适配层，接管原 9705 端口)
+Documentation=https://github.com/baidu/Unlimited-OCR
+# 依赖 docker（需要管理 vllm-ocr 引擎容器）；本服务不主动拉起引擎，
+# 首次请求到达时由 server_vllm 自动 docker start 引擎容器
+After=network.target remote-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=liu
+Group=liu
+WorkingDirectory=/data/www/wwwroot/Unlimited-OCR
+EnvironmentFile=-/data/www/wwwroot/Unlimited-OCR/.env
+Environment="PATH=/data/www/wwwroot/Unlimited-OCR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="CUDA_VISIBLE_DEVICES=0"
+# 显式覆盖 .env 中的 HOST/PORT（.env 里 PORT=9705 是历史遗留；本服务固定 9705）
+# systemd 中 Environment= 优先于 EnvironmentFile= 的同名变量
+Environment="HOST=0.0.0.0"
+Environment="PORT=9705"
+# 下游 vLLM 引擎地址与容器名（默认值已内置于 server_vllm.py，此处可留空注释参考）
+# Environment="VLLM_URL=http://127.0.0.1:9706/v1"
+# Environment="VLLM_CONTAINER=vllm-ocr"
+# 空闲卸载间隔（秒）：引擎空闲超时后自动 docker stop 释放显存
+# Environment="IDLE_UNLOAD_SECONDS=900"
+# 注意：ExecStart 硬编码端口（不用 ${PORT}），避免与 .env 中 PORT 产生变量展开歧义。
+ExecStart=/data/www/wwwroot/Unlimited-OCR/.venv/bin/uvicorn server_vllm:app --host 0.0.0.0 --port 9705
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=40
+
+# GPU 访问权限
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

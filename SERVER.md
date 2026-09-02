@@ -1,6 +1,8 @@
 # Unlimited-OCR 推理服务文档
 
-OpenAI 兼容的 OCR 推理 API 服务，基于 HuggingFace Transformers。
+OpenAI 兼容的 OCR 推理 API 服务。当前生产运行方式：**vLLM FP8 后端**（docker 容器引擎）+
+`server_vllm.py` 适配层（FastAPI），监听 **0.0.0.0:9705**（原 Transformers 版端口，2026-09 迁移）。
+API 层面与 Transformers 版完全一致（见文末差异说明）。
 
 ## 目录
 
@@ -19,18 +21,23 @@ OpenAI 兼容的 OCR 推理 API 服务，基于 HuggingFace Transformers。
 
 ## 快速开始
 
+> 当前生产 = vLLM FP8。Transformers 版（server.py）已停用，可回退（见文末）。
+
 ```bash
 cd /data/www/wwwroot/Unlimited-OCR
 source .venv/bin/activate
 
-# 手动启动
-uvicorn server:app --host 0.0.0.0 --port 9705
+# systemd（推荐，开机自启已 enable）
+sudo systemctl start unlimited-ocr-vllm
+sudo systemctl status unlimited-ocr-vllm
+sudo journalctl -u unlimited-ocr-vllm -f
 
-# 或 systemd
-sudo systemctl start unlimited-ocr
+# 手动启动（调试用）
+uvicorn server_vllm:app --host 0.0.0.0 --port 9705
 ```
 
-首次请求自动加载模型（~5-10s），空闲 15 分钟后自动卸载释放显存。
+首次请求会自动拉起下游 vLLM 引擎容器 `vllm-ocr`（docker，冷启动约 30-40s）；
+空闲 900s 后自动停止容器释放显存，下次请求再次自动拉起。
 
 ---
 
@@ -154,7 +161,7 @@ curl -s http://localhost:9705/v1/chat/completions \
     "messages": [{
       "role": "user",
       "content": [
-        {"type": "text", "text": "<image>\nFree OCR."},
+        {"type": "text", "text": "<image>document parsing."},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
       ]
     }],
@@ -181,7 +188,7 @@ response = client.chat.completions.create(
     messages=[{
         "role": "user",
         "content": [
-            {"type": "text", "text": "<image>\nFree OCR."},
+            {"type": "text", "text": "<image>document parsing."},
             {"type": "image_url", "image_url": {
                 "url": f"data:image/jpeg;base64,{b64}"
             }},
@@ -221,7 +228,7 @@ resp = requests.post(
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": "<image>\nFree OCR."},
+                {"type": "text", "text": "<image>document parsing."},
                 {"type": "image_url", "image_url": {
                     "url": f"data:image/jpeg;base64,{b64}"
                 }},
@@ -281,7 +288,7 @@ resp = requests.post(
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": "<image>\nFree OCR."},
+                {"type": "text", "text": "<image>document parsing."},
                 {"type": "image_url", "image_url": {
                     "url": "https://cdn.example.com/page.jpg"
                 }},
@@ -353,7 +360,7 @@ resp = requests.post(
         "max_pages": 10,
         "page_mode": "single",
         "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "<image>\nFree OCR."},
+            {"type": "text", "text": "<image>document parsing."},
             {"type": "image_url", "image_url": {"url": "/data/large-report.pdf"}},
         ]}],
         "max_tokens": 32768,
@@ -435,9 +442,9 @@ Unlimited-OCR 使用 `<image>` 标记指定图片位置，支持多种 prompt �
 
 | Prompt | 用途 | 输出特点 |
 |--------|------|----------|
-| `<image>\nFree OCR.` | **通用文档解析（默认）** | 自动识别标题、正文、图片，输出结构化 Markdown |
+| `<image>document parsing.` | **通用文档解析（默认）** | 自动识别标题、正文、图片，输出结构化 Markdown |
 | `<image>\n<\|grounding\|>Convert the document to markdown.` | 结构化 Markdown | 同 DS-OCR-2 的 grounding 模式 |
-| `<image>\ndocument parsing.` | 文档解析（官方示例） | 与官方 README 一致 |
+| `<image>\ndocument parsing.` | 文档解析（换行变体） | 效果与无换行版等同 |
 | `<image>\nMulti page parsing.` | 多页文档/PDF | 多图时自动使用，页间 `<PAGE>` 分隔 |
 | `<image>\nParse the figure.` | 图表解析 | 专注图表结构提取 |
 | `<image>\nExtract the text in the image.` | 纯文本提取 | 跳过布局分析，仅提取文字 |
@@ -446,7 +453,7 @@ Unlimited-OCR 使用 `<image>` 标记指定图片位置，支持多种 prompt �
 
 ```python
 # 默认通用模式（推荐）
-{"type": "text", "text": "<image>\nFree OCR."}
+{"type": "text", "text": "<image>document parsing."}
 
 # 指定图片位置，自由组合提示词
 {"type": "text", "text": "<image>\n识别图片中的表格内容。"}
@@ -481,52 +488,53 @@ headers = {"Authorization": "Bearer your-key"}
 
 ## 生命周期
 
-服务采用懒加载 + 空闲自动卸载：
+vLLM 引擎以 docker 容器运行，适配层负责生命周期（懒加载 + 空闲自动卸载）：
 
 ```
-COLD (显存 0) ──首次请求──► LOADING (~5-10s) ──就绪──► HOT (显存 ~6.4GB)
-                                                          │
-                                   空闲 > IDLE_UNLOAD_SECONDS
-                                                          │
-                                                          ▼
-                                                     COLD (自动卸载)
+COLD (容器停止, 显存 0) ──首次请求──► docker start vllm-ocr ──► LOADING (~30-40s) ──► HOT (FP8 ~8GB)
+                                                                                │
+                                         空闲 > IDLE_UNLOAD_SECONDS (900s)
+                                                                                │
+                                                                                ▼
+                                                              docker stop（显存释放回 COLD）
 ```
 
 ### 管理命令
 
 ```bash
-# 查看状态
+# 查看状态（status: ok=引擎就绪 / stopped=已空闲卸载 / degraded=引擎异常）
 curl http://localhost:9705/health | python3 -m json.tool
 
-# 手动卸载
+# 手动卸载（docker stop vllm-ocr，释放显存）
 curl -X POST http://localhost:9705/admin/unload \
   -H "Authorization: Bearer your-key"
+
+# 查看引擎容器
+sudo docker ps | grep vllm-ocr
 ```
 
 ---
 
 ## 配置参考
 
-```bash
-# .env
-MODEL_PATH=/data/www/models/Unlimited-OCR
-SERVED_MODEL_NAME=Unlimited-OCR
-HOST=0.0.0.0
-PORT=9705
-API_KEY=                    # 留空不校验
-IDLE_UNLOAD_SECONDS=900     # 空闲超时(秒)
-WATCHDOG_POLL_SECONDS=10    # 看门狗间隔(秒)
-MAX_PAGES_PER_BATCH=20      # 每批最多处理页数（防OOM）
-```
+适配层通过环境变量 / service 文件配置（.env 仍会读取，同名以 service 的
+Environment 或 ExecStart 硬编码为准）：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL_PATH` | `/data/www/models/Unlimited-OCR` | 模型路径 |
-| `PORT` | `10000` | 服务端口 |
+| `VLLM_URL` | `http://127.0.0.1:9706/v1` | 下游 vLLM 引擎 OpenAI 端点 |
+| `VLLM_CONTAINER` | `vllm-ocr` | 引擎 docker 容器名 |
+| `VLLM_START_ARGS` | (内置) | 容器不存在时重建的 docker run 参数 |
+| `VLLM_START_TIMEOUT` | `240` | 等待引擎就绪超时(秒) |
+| `VLLM_MAX_TOKENS` | `8192` | 单次生成 token 上限 |
+| `VLLM_MAX_IMAGES_PER_REQ` | `3` | 单请求最多图片数（引擎 context 上限） |
+| `ENGINE_MODEL_NAME` | `Unlimited-OCR` | 引擎中的模型名（served-model-name） |
+| `SERVED_MODEL_NAME` | `Unlimited-OCR` | API 响应的模型名 |
 | `API_KEY` | 空 | API 认证密钥 |
-| `IDLE_UNLOAD_SECONDS` | `900` | 空闲卸载超时(秒) |
+| `IDLE_UNLOAD_SECONDS` | `900` | 空闲后 docker stop 引擎(秒) |
 | `WATCHDOG_POLL_SECONDS` | `10` | 看门狗检查间隔 |
 | `MAX_PAGES_PER_BATCH` | `20` | PDF 每批最多页数 |
+| `PORT` | (service 硬编码 9705) | 监听端口，勿从 .env 继承 |
 
 ---
 
@@ -554,3 +562,32 @@ MAX_PAGES_PER_BATCH=20      # 每批最多处理页数（防OOM）
 ```
 
 请求体和响应体格式完全一致，只需改模型名。
+
+---
+
+## 后端差异：vLLM FP8 vs Transformers（旧）
+
+当前服务（`server_vllm.py` + docker 引擎）与旧 Transformers 版（`server.py`）
+在 **API 层面完全一致**（认证/端点/输入方式/Markdown 输出/图片提取均相同），
+内部差异：
+
+| 维度 | Transformers（旧，已停用） | vLLM FP8（当前） |
+|------|:---:|:---:|
+| 单页耗时 | ~9s | **~3.3s**（快 2.7 倍） |
+| 显存（活跃） | ~8.6GB | ~8GB |
+| 显存（空闲） | 进程内卸载 | 容器停止，全释放 |
+| 冷启动 | ~5-10s | ~30-40s（docker start + 加载） |
+| R-SWA 长文档 | 完整 | 完整（官方实现） |
+| 输出格式 | 相同 | 相同（`skip_special_tokens=False` 保留 `<\|det\|>`） |
+| 质量 | 基准 | 与 bf16 一致（逐字节 diff 仅同义词噪声） |
+
+### 回退到 Transformers 版
+
+```bash
+# 1. 停 vLLM 适配层（让出 9705）
+sudo systemctl stop unlimited-ocr-vllm && sudo systemctl disable unlimited-ocr-vllm
+
+# 2. 启用旧版
+sudo systemctl enable --now unlimited-ocr
+```
+
