@@ -82,6 +82,9 @@ def test_vllm_chat_payload_keeps_det_tokens():
         req = m_urlopen.call_args.args[0]
         payload = json.loads(req.data)
         assert payload["skip_special_tokens"] is False
+        assert payload["vllm_xargs"] == {"ngram_size": 35, "window_size": 128}, (
+            "必须携带 vllm_xargs 启用引擎侧 NGram 防重复，否则处理器被静默禁用"
+        )
         assert payload["messages"][0]["content"][0]["text"] == "<image>document parsing."
         assert payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:")
         # 输出原样返回

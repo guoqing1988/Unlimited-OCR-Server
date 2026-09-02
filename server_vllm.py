@@ -104,6 +104,17 @@ VLLM_START_TIMEOUT = int(os.environ.get("VLLM_START_TIMEOUT", "240"))
 # 下游引擎推理时使用的采样参数（对齐原 Transformers infer 的贪心+防重复配置）
 VLLM_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "8192"))
 
+# ── NGram 防重复（关键！）────────────────────────────────────────────
+# 下游 vLLM 引擎以 --logits_processors 注册了 NGramPerReqLogitsProcessor，
+# 但该处理器只有在请求携带 extra_args(vllm_xargs) 时才会真正启用：
+#   若 extra_args 缺 ngram_size，new_req_logits_processor() 返回 None，
+#   防重复被静默禁用 → 模型自回归出现短句循环（如"圖謀刺殺圖謀刺殺…"）
+#   时无任何防护，直接生成到 max_tokens 耗尽。
+# vLLM unlimited_ocr 模块 docstring 推荐：ngram_size=35, window_size=128。
+# 引擎采样窗口上限 32768，此值经官方模型验证，无需随 max_tokens 调整。
+NGRAM_SIZE = int(os.environ.get("NGRAM_SIZE", "35"))
+NGRAM_WINDOW = int(os.environ.get("NGRAM_WINDOW", "128"))
+
 # 下游引擎名称（vLLM serve 时指定的 served-model-name）
 ENGINE_MODEL_NAME = os.environ.get("ENGINE_MODEL_NAME", "Unlimited-OCR")
 
@@ -712,6 +723,12 @@ def vllm_chat(
         "temperature": temperature,
         # 关键：保留 <|det|> 标签供 process_raw_output 解析
         "skip_special_tokens": False,
+        # 关键：启用引擎侧 NGram 防重复（无此字段处理器被静默禁用，
+        # 模型短句循环时无防护 → 会一直重复生成到 max_tokens 耗尽）
+        "vllm_xargs": {
+            "ngram_size": NGRAM_SIZE,
+            "window_size": NGRAM_WINDOW,
+        },
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
