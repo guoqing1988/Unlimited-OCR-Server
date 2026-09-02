@@ -758,6 +758,156 @@ def vllm_chat(
     return text
 
 
+# ═══════════════════════════════════════════════════════════════
+# 幻觉护栏（后处理防循环/无中生有）
+# ═══════════════════════════════════════════════════════════════
+# 模型对读不出的区域（英文报纸密排小字、图形栏等）会陷入两类幻觉：
+#   1. 循环重复：同一短句反复输出（"圖謀刺殺圖謀刺殺…"、"The first, The first…"），
+#      或在同坐标带反复输出同一行，直到 max_tokens 耗尽；
+#   2. 声明式幻觉：把"该栏无文字"误当正文输出（
+#      "The image contains no text. The horizontal lines are…"），
+#      或塞入训练语料高频垃圾句（"quick brown fox"、"2017年…交易金额…"）。
+# 此类行对用户无意义且污染 Markdown，统一在 process_raw_output 前过滤。
+# 注意：护栏只删"确定幻觉"的行，对正常文本零影响（NGram 防重复仍由引擎负责）。
+
+# 已知幻觉/垃圾文本标记（子串匹配，出现即整行丢弃）。
+# 覆盖：英文练习句、无文字区声明、财务模板幻句等训练语料高频噪声。
+_HALLUC_MARKERS = (
+    # 英文字母练习句（font specimen 常见，真实版面不会整句出现）
+    'quick brown fox jumps over the lazy dog',
+    # 无文字/图形区说明（模型把版面判断当正文输出）
+    'The image contains no text', 'horizontal lines are', 'background elements',
+    'must be ignored', 'must not be ignored',
+    # 中文财务模板幻觉（完整句才触发，避免误伤正常含金融词的文档）
+    '2017年1月1日', '公司与关联方', '4,000万元',
+    # 英文版面碎句（读不出时逐行编造的残句）
+    'Mrs. Egan said', 'Fairytale', 'Priscope', 'Antipodeus',
+    'The world and a DC', 'They were a DC',
+)
+
+# 文本行 y 坐标越界阈值（归一化 [0,999]）：y1 贴底/超高说明模型在页面外继续虚构行
+_Y1_OUT_OF_PAGE = 995
+# 文本行 y 跨度阈值：正常文字行高度远小于整页，span>=500 说明是"整栏无文字说明"
+_Y_SPAN_ABSURD = 500
+# 重复文本行丢弃阈值：同一归一化文本出现 >=N 次视为循环（保留首次）
+_REPEAT_DROP_N = 2
+
+
+def _norm_text(t: str) -> str:
+    """归一化文本用于重复检测：去行首序号/符号，小写并保留中英文/数字。"""
+    s = re.sub(r'^[\s(（]*\d{1,3}[\s)）、.:，,]*', '', t)
+    return re.sub(r'[^\w\u4e00-\u9fff]', '', s.lower())
+
+
+def _cut_inline_loop(t: str) -> str:
+    """截断行内循环：若文本含 >=4 字符单元连续重复 >=3 次，截到循环起点。
+
+    覆盖单行内反复输出同一短句的幻觉（如 "The first, The first, The first…"、
+    中文 "圖謀刺殺圖謀刺殺…" 4 字单元循环）。大小写不敏感匹配；未发现循环时
+    原样返回。下限 4 字符：正常文本不会连续 3 次以上重复 4 字短语。
+    """
+    tl = t.lower()
+    for u in range(4, min(61, len(tl) // 3 + 1)):
+        s = 0
+        while s + 3 * u <= len(tl):
+            unit = tl[s:s + u]
+            if tl[s + u:s + 2 * u] == unit and tl[s + 2 * u:s + 3 * u] == unit:
+                return t[:s + u]
+            s += 1
+    return t
+
+
+def strip_hallucinations(raw_text: str) -> str:
+    """清理模型输出中的循环/声明式幻觉行（防幻觉护栏，纯后处理）。
+
+    规则（按序，命中即丢弃该行）：
+      1. det text 行 y1 >= 995：模型在页面底部外继续虚构行；
+      2. det text 行 y 跨度 >= 500：模型把"整栏无文字"当正文输出；
+      3. 文本含已知幻觉标记（_HALLUC_MARKERS）；
+      4. 行内循环（_cut_inline_loop 截断）后仍与其它行重复 >= 2 次（保留首次）；
+      5. 孤儿行若以 det 标签开头（解析失败碎片）整行丢弃。
+
+    参数:
+        raw_text: 模型原始输出（含 <|det|> 标签）。
+
+    返回:
+        清理后的文本。正常页面应逐字节不变（对合法文本零影响）。
+    """
+    det_re = re.compile(r'<\|det\|>\s*([A-Za-z_][\w-]*)\s*(\[[^\]]+\])\s*<\|/det\|>\s*(.*)')
+    parsed = []
+    for ln in raw_text.split('\n'):
+        m = det_re.match(ln)
+        if m:
+            # group(2) 形如 "[918, 28, 928, 38]"，去首尾方括号后切分
+            nums = [int(x) for x in m.group(2)[1:-1].split(',')]
+            y1, y2 = (nums[1], nums[3]) if len(nums) >= 4 else (-1, -1)
+            parsed.append({
+                'ln': ln, 'dt': m.group(1), 't': m.group(3),
+                'y1': y1, 'y2': y2, 'orphan': False,
+            })
+        else:
+            t = ln.strip()
+            parsed.append({
+                'ln': ln, 'dt': None, 't': t or None,
+                'y1': None, 'y2': None, 'orphan': bool(t),
+            })
+
+    # 全局限重计数（det text 与孤儿行统一按归一化文本统计）
+    cnt: dict[str, int] = {}
+    for p in parsed:
+        if p['t'] and len(_norm_text(p['t'])) >= 4:
+            n = _norm_text(p['t'])
+            cnt[n] = cnt.get(n, 0) + 1
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parsed:
+        t = p['t']
+        if not t:
+            out.append(p['ln'])
+            continue
+
+        # 规则5：孤儿行若是 det 解析失败碎片（以标签开头但格式残缺）→ 丢弃
+        if p['orphan'] and t.startswith('<|det|>'):
+            continue
+
+        drop = False
+        if not p['orphan'] and p['dt'] == 'text':
+            # 规则1+2：越界/全页高行（模型在页面外或整栏虚构）
+            if p['y1'] is not None and p['y1'] >= _Y1_OUT_OF_PAGE:
+                drop = True
+            elif p['y2'] is not None and p['y2'] - p['y1'] >= _Y_SPAN_ABSURD:
+                drop = True
+
+        # 规则3：已知幻觉/垃圾标记
+        if not drop and any(mk in t for mk in _HALLUC_MARKERS):
+            drop = True
+
+        # 行内循环截断（det 行重建文本；孤儿行直接替换）
+        t2 = t if drop else _cut_inline_loop(t)
+        if not drop and t2 != t:
+            if p['orphan']:
+                t = t2
+                p['ln'] = t2
+            else:
+                m2 = det_re.match(p['ln'])
+                p['ln'] = p['ln'][:m2.start(3)] + t2  # 仅替换标签后的文本部分
+            t = t2
+
+        # 规则4：全局限重（>=N 次只保留首次）
+        if not drop and t and len(_norm_text(t)) >= 4:
+            n = _norm_text(t)
+            if cnt.get(n, 0) >= _REPEAT_DROP_N:
+                if n in seen:
+                    drop = True
+                else:
+                    seen.add(n)
+
+        out.append('' if drop else p['ln'])
+
+    return '\n'.join(out)
+
+
 def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> str:
     """
     将模型 eval_mode=True 返回的 raw 文本处理为完整 Markdown。
@@ -800,6 +950,12 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     if raw_text.endswith(stop_str):
         raw_text = raw_text[:-len(stop_str)]
     raw_text = raw_text.strip()
+
+    # ── 第1.5步：幻觉护栏（后处理过滤循环/无中生有行） ──
+    # 模型对读不出的区域（英文密排小字、图形栏）会循环重复同一短句或输出
+    # "该栏无文字"等声明式幻觉，直至 max_tokens 耗尽。此步在解析前清洗，
+    # 正常页面零影响（详见 strip_hallucinations docstring）。
+    raw_text = strip_hallucinations(raw_text)
 
     # ── 第2步：加载原始图片（用于后续按坐标裁剪） ──
     # 图片宽高用于将 [0,999] 归一化坐标映射到实际像素坐标

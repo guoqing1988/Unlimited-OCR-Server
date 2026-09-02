@@ -194,3 +194,100 @@ def test_container_status_missing_when_docker_error():
     with mock.patch.object(sv, "_docker", side_effect=RuntimeError("No such container")):
         st = sv._container_status()
         assert st == "missing"
+
+
+# ─────────────────────────────────────────────────────────────
+# 幻觉护栏 strip_hallucinations 测试
+# ─────────────────────────────────────────────────────────────
+
+def test_guard_keeps_normal_text():
+    """正常 det 文本行（含相似结构）不应被误删。"""
+    raw = (
+        "<|det|>title [98, 39, 350, 63]<|/det|>天外怪客大鬧香港？\n"
+        "<|det|>text [33, 131, 205, 203]<|/det|>和諧式飛機有幾樣特點\n"
+        "<|det|>text [29, 226, 201, 279]<|/det|>一、它縮短旅途時間\n"
+        "<|det|>page_number [918, 28, 928, 38]<|/det|>5\n"
+    )
+    assert sv.strip_hallucinations(raw) == raw
+
+
+def test_guard_drops_repeated_lines():
+    """同一文本行重复 >=2 次时应只保留首次。"""
+    raw = (
+        "<|det|>text [399, 249, 486, 255]<|/det|>hello world line\n"
+        "<|det|>text [399, 255, 486, 261]<|/det|>hello world line\n"
+        "<|det|>text [399, 261, 486, 267]<|/det|>hello world line\n"
+    )
+    out = sv.strip_hallucinations(raw)
+    assert out.count("hello world line") == 1
+    assert out.count("<|det|>") == 1
+
+
+def test_guard_drops_halluc_markers():
+    """含已知幻觉模板句的行（quick brown fox / 无文字声明 / 财务模板）应删除。"""
+    raw = (
+        "<|det|>text [33, 131, 205, 203]<|/det|>正常中文段落內容\n"
+        "<|det|>text [399, 315, 486, 321]<|/det|>The quick brown fox jumps over the lazy dog.\n"
+        "<|det|>text [399, 300, 486, 999]<|/det|>The image contains no text. The horizontal lines are stylistic\n"
+        "<|det|>text [399, 300, 486, 999]<|/det|>(1) 2017年1月1日，公司与关联方发生的交易金额为人民币4,000万元。\n"
+    )
+    out = sv.strip_hallucinations(raw)
+    assert "正常中文段落內容" in out
+    assert "quick brown fox" not in out
+    assert "image contains no text" not in out
+    assert "2017年" not in out
+
+
+def test_guard_drops_out_of_page_lines():
+    """y1 >= 995（页面底部外虚构行）与 y 跨度 >= 500（整栏无文字说明）应删除。"""
+    raw = (
+        "<|det|>text [399, 987, 486, 999]<|/det|>tail line ok\n"
+        "<|det|>text [399, 999, 486, 999]<|/det|>phantom bottom line\n"
+        "<|det|>text [399, 0, 486, 999]<|/det|>whole column nonsense\n"
+    )
+    out = sv.strip_hallucinations(raw)
+    assert "phantom bottom line" not in out
+    assert "whole column nonsense" not in out
+    assert "tail line ok" in out
+
+
+def test_guard_cuts_inline_loop():
+    """单行内循环（大小写混排）应截断到循环起点。"""
+    raw = (
+        "<|det|>text [399, 249, 486, 255]<|/det|>the first. The first, the first, the first, the first, the first\n"
+    )
+    out = sv.strip_hallucinations(raw)
+    assert "the first" in out
+    # 行内循环截断后不应再有 3 连重复
+    seg = out.split("<|/det|>")[1]
+    assert seg.count("the first, the first, the first") == 0
+
+
+def test_guard_drops_orphan_det_fragments():
+    """孤儿行若以残缺 det 标签开头（解析失败碎片）应删除。"""
+    raw = (
+        "<|det|>text [33, 131, 205, 203]<|/det|>正常內容\n"
+        "<|det|>text [399, 999, 486, 999]]\n"   # 括号残缺 → 孤儿行
+    )
+    out = sv.strip_hallucinations(raw)
+    assert "正常內容" in out
+    assert "999]]" not in out
+
+
+def test_guard_empty_and_plain_text():
+    """空文本与无 det 的普通孤立行不受影响。"""
+    assert sv.strip_hallucinations("") == ""
+    plain = "Just a bare line without det tags\n\nanother line"
+    assert sv.strip_hallucinations(plain) == plain
+
+
+def test_guard_cuts_cjk_inline_loop():
+    """中文 4 字单元行内循环（罪狀/圖謀刺殺类）应截断。"""
+    raw = (
+        "<|det|>text [33, 249, 205, 300]<|/det|>罪狀第三條：圖謀刺殺圖謀刺殺圖謀刺殺圖謀刺殺圖謀刺殺\n"
+    )
+    out = sv.strip_hallucinations(raw)
+    seg = out.split("<|/det|>")[1]
+    # 应截到首个单元结束，不再有多连重复
+    assert "罪狀第三條：圖謀刺殺" in seg
+    assert "刺殺圖謀刺殺圖謀" not in seg
