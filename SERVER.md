@@ -463,6 +463,13 @@ Unlimited-OCR 使用 `<image>` 标记指定图片位置，支持多种 prompt �
 
 ### 内置 Prompt 预设
 
+> **v2 (GGUF) 后端说明**：当前生产后端为 Unlimited-OCR-2，适配层会把官方默认指令
+> `document parsing.` / `Multi page parsing.` 统一**过滤掉**，交给模型内嵌模板补
+> `Multi page parsing.`。实测显式发 `document parsing.` 会让 v2 模型进入错误解析路径、
+> 输岀幻觉循环（同一张问卷图：模板默认 40 行正确 vs `document parsing.` 43 行全幻觉）。
+> 因此调用时**不传文本**或传上面两个默认指令均可；只有自定义指令（如 `请提取表格`）
+> 才会真正发送。
+
 | Prompt | 用途 | 输出特点 |
 |--------|------|----------|
 | `<image>document parsing.` | **通用文档解析（默认）** | 自动识别标题、正文、图片，输出结构化 Markdown |

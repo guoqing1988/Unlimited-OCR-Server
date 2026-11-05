@@ -42,6 +42,7 @@ import shutil
 import re
 import warnings
 import logging
+from collections import deque
 from pathlib import Path
 
 # ── 日志 ─────────────────────────────────────────────────────────
@@ -734,6 +735,69 @@ def image_to_data_uri(img_path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+# ── 生成期循环熔断（流式早停）──────────────────────────────────
+# 模型对读不出的页面会整行重复（同一行反复输出），跑满 max_tokens 才停
+# （实测 8192 tokens ≈ 40s）。这里改用流式接收，一旦检测到整行循环就主动
+# 断开连接：llama-server 会立即 cancel 任务释放算力，已生成的有效内容照常
+# 返回，最坏耗时从 40s 降到几秒。后处理的 strip_hallucinations 仍作为第二道防线。
+_STREAM_LOOP_MIN_LINES = 25     # 至少累积行数后才启用检测（避免短输出误判）
+_STREAM_LOOP_REPEAT_N = 4       # 同一行（规范化后）出现 >=N 次判为循环
+_STREAM_LOOP_WINDOW = 60        # 只看最近 N 行
+_STREAM_LOOP_NGRAM_SIZE = 5     # 近似重复检测的字符 n-gram 长度
+_STREAM_LOOP_NGRAM_MOD = 0.7    # 同一 n-gram 覆盖 >=70% 的行判为近似循环
+
+
+def _stream_loop_detected(recent, since_last: int = 0) -> bool:
+    """判断最近输出行是否已陷入循环（用于流式早停）。
+
+    两条规则（命中任一即判循环）：
+      1. 整行完全相同：同一行规范化后出现 >= _STREAM_LOOP_REPEAT_N 次；
+      2. 近似重复：同一 5 字词组出现在窗口内 >= 70% 的行中
+         （模型对读不出的区域会反复套同一句式，每行微调几个字，
+         整行不相同但词组成分高度重复，如 “本調查委員會…本調查委員會…”）。
+
+    要求总行数 >= _STREAM_LOOP_MIN_LINES，避免短文档的合法重复被误判。
+
+    Args:
+        recent: 最近若干行文本（deque），已去掉结构标签行与空行。
+        since_last: 距上次检测新增的行数；不足 3 行时跳过开销较大的
+                    n-gram 统计（每次 chunk 都算会拖慢流式接收）。
+
+    Returns:
+        True 表示检测到循环，调用方应立即断开流。
+    """
+    if len(recent) < _STREAM_LOOP_MIN_LINES:
+        return False
+
+    # ── 规则 1：整行完全相同 ──
+    cnt: dict[str, int] = {}
+    for ln in recent:
+        n = _norm_text(ln)
+        if len(n) < 4:
+            continue
+        cnt[n] = cnt.get(n, 0) + 1
+        if cnt[n] >= _STREAM_LOOP_REPEAT_N:
+            return True
+
+    # ── 规则 2：近似重复（同一词组覆盖大多数行）──
+    if since_last < 3:
+        return False
+    rows: list[str] = []
+    for ln in recent:
+        txt = re.sub(r'\s+', '', ln.split('<FORK>')[-1])
+        if len(txt) >= 8:
+            rows.append(txt)
+    if len(rows) < 20:
+        return False
+    gram: dict[str, int] = {}
+    for r in rows:
+        for g in {r[i:i + _STREAM_LOOP_NGRAM_SIZE] for i in range(len(r) - _STREAM_LOOP_NGRAM_SIZE + 1)}:
+            gram[g] = gram.get(g, 0) + 1
+    if not gram:
+        return False
+    return max(gram.values()) >= _STREAM_LOOP_NGRAM_MOD * len(rows)
+
+
 def llama_chat(
     prompt: str,
     image_paths: list[str],
@@ -763,10 +827,16 @@ def llama_chat(
     异常:
         RuntimeError: 引擎不可达或返回非 200。
     """
-    # 自定义指令：去掉 <image> 占位符后，若不是官方默认指令则保留；
-    # 默认指令交给内嵌 chat template 生成（避免文本出现在图片之前）
+    # ── 指令文本处理（实测结论，勿改）────────────────────────────
+    # 模型（Unlimited-OCR-2）只认 "Multi page parsing."：
+    #   - 不发文本 → 内嵌模板自动补 "Multi page parsing." → 正确
+    #   - 显式发 "Multi page parsing."               → 正确
+    #   - 发 "document parsing."                      → 幻觉循环（实测）
+    # 所以官方两个默认指令都不显式发送，交给模板；只有真正的自定义指令
+    # （如 "请提取表格"）才放在图片之后发送。
+    # 注意：自定义文本必须放在图片之后，否则模板会把它渲染到第一页前面。
     custom = prompt.replace("<image>", "").strip()
-    if custom in ("", "document parsing.", "Multi page parsing."):
+    if custom in ("document parsing.", "Multi page parsing."):
         custom = ""
 
     content: list[dict] = []
@@ -775,15 +845,26 @@ def llama_chat(
             "type": "image_url",
             "image_url": {"url": image_to_data_uri(p)},
         })
+    # ── 指令文本必须放在图片之后 ──
+    # 模板会渲染为 "<PAGE><image>Multi page parsing."；若文本在图片之前会被
+    # 放到第一页前面（多页时会错位）。
     if custom:
-        # 模板只在文本位于图片之后时保留，因此追加到末尾
         content.append({"type": "text", "text": custom})
+
+    # 流式接收的累积缓冲与循环检测窗口
+    chunks: list[str] = []
+    recent: deque[str] = deque(maxlen=_STREAM_LOOP_WINDOW)
+    loop_broken = False
+    line_buf = ""          # 未以换行结尾的残行（等后续 chunk 拼完再入窗口）
+    since_last_check = 0   # 距上次循环检测新增的完整行数
 
     payload = {
         "model": ENGINE_MODEL_NAME,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
         "temperature": temperature,
+        # 流式返回：用于生成期循环检测（检测到整行循环立即断开，省下大量时间）
+        "stream": True,
         # 关键：保留 <BLOCK>/<FORK>/<PAGE> 等特殊 token 供后处理解析
         "skip_special_tokens": False,
         # 关键：DRY 防重复（llama.cpp 无 vLLM 的 NGram 处理器，
@@ -802,7 +883,45 @@ def llama_chat(
     )
     try:
         with urllib.request.urlopen(req, timeout=900) as resp:
-            data = json.loads(resp.read())
+            if hasattr(resp, "__iter__"):
+                # ── 流式接收：边收边检测整行循环 ──
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    for ch in obj.get("choices") or []:
+                        piece = (ch.get("delta") or {}).get("content")
+                        if not piece:
+                            continue
+                        chunks.append(piece)
+                        # 按换行切出完整行再入窗口（最后一段残行留给下个 chunk）
+                        line_buf += piece
+                        while "\n" in line_buf:
+                            ln, line_buf = line_buf.split("\n", 1)
+                            ln = ln.strip()
+                            # 结构标签行（<PAGE>/<MERGE>）不参与循环统计
+                            if ln and not ln.startswith("<"):
+                                recent.append(ln)
+                                since_last_check += 1
+                    if since_last_check >= 3 and _stream_loop_detected(recent, since_last_check):
+                        loop_broken = True
+                        break
+            else:
+                # 非流式响应（测试替身 / 旧版引擎）：一次性解析
+                data = json.loads(resp.read())
+                choices = data.get("choices") or []
+                if not choices:
+                    raise RuntimeError(
+                        f"llama-server 响应缺少 choices: {json.dumps(data)[:300]}"
+                    )
+                return choices[0]["message"].get("content", "")
     except urllib.error.HTTPError as e:
         # 读取错误响应体，便于排查
         detail = ""
@@ -814,10 +933,12 @@ def llama_chat(
     except urllib.error.URLError as e:
         raise RuntimeError(f"llama-server 不可达: {e.reason}") from e
 
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"llama-server 响应缺少 choices: {json.dumps(data)[:300]}")
-    return choices[0]["message"].get("content", "")
+    if loop_broken:
+        logger.info(
+            "生成期检测到整行循环，提前断开（已接收 %d 字符，引擎已停止生成）",
+            sum(len(c) for c in chunks),
+        )
+    return "".join(chunks)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -854,6 +975,47 @@ _Y_SPAN_ABSURD = 500
 # 重复文本行丢弃阈值：同一归一化文本出现 >=N 次视为循环（保留首次）
 _REPEAT_DROP_N = 2
 
+# 模型格式崩溃时产生的碎片行特征：
+#   1) 缺 <BLOCK> 前缀的块标签，如 image[0, 0, 999, 999]、text[12, 34, 56, 78]
+#   2) 残缺标签，如单独一行的 <BLOCK>/<FORK>/<PAGE>/<MERGE>/<LEVEL1>
+_JUNK_LABEL_RE = re.compile(
+    r'^\s*(?:'
+    r'<(?:BLOCK|FORK|LEVEL\d+)>'  # 残缺标签（<PAGE>/<MERGE> 是结构标签，不在此列）
+    r'|(?:image|text|title|subtitle|header|footer|page_number)\s*\['  # 缺 BLOCK 前缀的块标签
+    r')'
+)
+# 纯坐标数组行（必须以 [ 开头或 ] 结尾，避免误伤 "1, 2, 3" 这类纯数字正文）
+_JUNK_COORD_RE = re.compile(r'^\s*(?:\[[\s\[\]0-9,，.\-]*|[\s0-9,，.\-]*\])\s*$')
+# 纯标点/省略号行（如 "..."、"。。"），至少 2 个标点字符
+_JUNK_PUNCT_RE = re.compile(r'^\s*[.…。、，,·:：;；\-—_~!！?？]{2,}\s*$')
+
+
+def _is_junk_fragment(t: str) -> bool:
+    """判断孤立行是否为标签/坐标/标点碎片（模型格式崩溃产物）。
+
+    模型在难识别的页面上偶发输出残缺标签与坐标数组，例如：
+        image[0, 0, 999, 999]
+        [119, 1, 2, 0, 3, 0
+        [0, 200, 800, 400, 2000]
+        [1]
+    这些行没有完整 ``<BLOCK>type[coords]<FORK>文本`` 结构，不属于正文，
+    必须在解析阶段整行丢弃，否则会原样出现在 Markdown 结果里。
+
+    含任何文字字符的正常行不会被误判（正常表格行如 "1, 2, 3" 也无 [] 包围）。
+
+    Args:
+        t: 待判断的孤立行文本（已 strip）。
+
+    Returns:
+        True 表示是碎片行，应丢弃。
+    """
+    s = t.strip()
+    if not s:
+        return False
+    return bool(
+        _JUNK_LABEL_RE.match(s) or _JUNK_COORD_RE.match(s) or _JUNK_PUNCT_RE.match(s)
+    )
+
 
 def _norm_text(t: str) -> str:
     """归一化文本用于重复检测：去行首序号/符号，小写并保留中英文/数字。"""
@@ -887,7 +1049,7 @@ def strip_hallucinations(raw_text: str) -> str:
       2. det text 行 y 跨度 >= 500：模型把"整栏无文字"当正文输出；
       3. 文本含已知幻觉标记（_HALLUC_MARKERS）；
       4. 行内循环（_cut_inline_loop 截断）后仍与其它行重复 >= 2 次（保留首次）；
-      5. 孤儿行若以 det 标签开头（解析失败碎片）整行丢弃。
+      5. 孤儿行若是解析失败碎片（残缺标签、坐标数组、纯标点）整行丢弃。
 
     参数:
         raw_text: 模型原始输出（含 <BLOCK> 标签）。
@@ -932,9 +1094,19 @@ def strip_hallucinations(raw_text: str) -> str:
             out.append(p['ln'])
             continue
 
-        # 规则5：孤儿行若是块解析失败碎片（以标签开头但格式残缺）→ 丢弃
-        if p['orphan'] and t.startswith('<BLOCK>'):
-            continue
+        # 规则5：孤儿行若是块解析失败碎片（残缺标签/坐标数组/纯标点）→ 丢弃
+        if p['orphan']:
+            # 先剥离行首结构前缀（<PAGE>/<MERGE>）与重复 <BLOCK>，再判断：
+            #   <PAGE><BLOCK>header[...]   → 剥后能完整解析 → 保留
+            #   <BLOCK><BLOCK>text[...]    → 剥后能完整解析 → 保留
+            #   <MERGE> 单独成行           → 剥后为空 → 保留（跨页合并语义）
+            probe = re.sub(r'^(?:<PAGE>|<MERGE>)\s*', '', t)
+            if probe.startswith('<BLOCK>'):
+                probe = re.sub(r'^(?:<BLOCK>\s*)+', '<BLOCK>', probe)
+            if not det_re.match(probe) and (
+                probe.startswith('<BLOCK>') or _is_junk_fragment(probe)
+            ):
+                continue
 
         drop = False
         if not p['orphan'] and p['dt'] == 'text':
@@ -970,7 +1142,57 @@ def strip_hallucinations(raw_text: str) -> str:
 
         out.append('' if drop else p['ln'])
 
-    return '\n'.join(out)
+    return '\n'.join(_cut_near_loop(out))
+
+
+def _cut_near_loop(lines: list[str], size: int = 5, mod: float = 0.75,
+                   min_rows: int = 25) -> list[str]:
+    """截断整页近似重复（同一词组覆盖大多数行）。
+
+    模型对读不出的页面会反复套同一句式，每行只微调几个字：
+        本调查委员会将根据本调查结果，并将本调查委员会提交给本调查委员会。
+        本调查委员会的结论将於本调查报告上发表，并将於本调查委员会上发表。
+    ……每行不完全相同，行级去重删不掉，但从页级看，某个 5 字词组会覆盖
+    绝大多数行。此函数从尾部向前收缩，找出这样的循环起点并截断。
+
+    正常文档不会出现“同一 5 字词组覆盖 >=75% 的行”（标题/表格重复也不至于），
+    因此对正常页面零影响。
+
+    Args:
+        lines: 已过行级去重的输出行（含 <BLOCK> 标签或正文）。
+        size:  n-gram 长度。
+        mod:   覆盖率阈值（同一 n-gram 出现在该比例以上的行即判循环）。
+        min_rows: 至少多少行文本才启用（避免短页误判）。
+
+    Returns:
+        截断后的行列表（未检测到循环时原样返回）。
+    """
+    texts: list[str | None] = []
+    for ln in lines:
+        if '<FORK>' in ln:
+            txt = re.sub(r'\s+', '', ln.split('<FORK>')[-1])
+            texts.append(txt if len(txt) >= 8 else None)
+        else:
+            texts.append(None)
+    idx = [i for i, t in enumerate(texts) if t]
+    if len(idx) < min_rows:
+        return lines
+    rows = [texts[i] or "" for i in idx]
+
+    # 从前往后找最早一个“尾部仍覆盖超标”的起点
+    for s in range(len(rows) - min_rows + 1):
+        sub = rows[s:]
+        gram: dict[str, int] = {}
+        for t in sub:
+            for g in {t[k:k + size] for k in range(len(t) - size + 1)}:
+                gram[g] = gram.get(g, 0) + 1
+        if gram and max(gram.values()) >= mod * len(sub):
+            logger.info(
+                "检测到整页近似重复循环（%d 行起，共 %d 行）：已截断，保留前 %d 行内容",
+                s, len(sub), idx[s],
+            )
+            return lines[:idx[s]]
+    return lines
 
 
 def _box_iou(a, b) -> float:
@@ -1105,11 +1327,18 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
             if not stripped:
                 continue
 
+        # 模型偶发重复输出块前缀（如 <BLOCK><BLOCK>text[...]），合并为单个
+        if stripped.startswith('<BLOCK>'):
+            stripped = re.sub(r'^<BLOCK>\s*(?:<BLOCK>\s*)+', '<BLOCK>', stripped)
+
         m = block_re.search(stripped)
 
         if not m:
             # ── 无块标签的行（孤立行） ──
             line_clean = stripped
+            # 丢弃标签/坐标/标点碎片行（模型格式崩溃产物，不是正文）
+            if line_clean and _is_junk_fragment(line_clean):
+                continue
             if line_clean:
                 if _listish_pattern.match(line_clean):
                     # 连续列表项不加空行

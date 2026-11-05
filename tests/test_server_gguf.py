@@ -70,20 +70,27 @@ def test_build_engine_cmd_basic():
 # llama_chat 请求构造
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_llama_chat_default_prompt_sends_images_only():
-    """默认指令由 chat template 生成，请求体里不应出现 text 块。"""
-    with mock.patch.object(sg.urllib.request, "urlopen", return_value=_FakeResp(
-        {"choices": [{"message": {"content": "<PAGE><BLOCK>text[0,0,1,1]<FORK>hi"}}]}
-    )) as m:
-        out = sg.llama_chat("<image>document parsing.", [_make_image_path()])
-    assert out.startswith("<PAGE>")
-    payload = json.loads(m.call_args[0][0].data)
-    content = payload["messages"][0]["content"]
-    assert all(block["type"] == "image_url" for block in content)
-    assert payload["skip_special_tokens"] is False
-    assert payload["dry_multiplier"] == sg.DRY_MULTIPLIER
-    assert payload["dry_allowed_length"] == sg.DRY_ALLOWED_LENGTH
-    assert payload["model"] == sg.ENGINE_MODEL_NAME
+def test_llama_chat_default_prompt_not_sent():
+    """官方默认指令不显式发送：模型只认模板补的 "Multi page parsing."。
+
+    实测：显式发 "document parsing." 会让 v2 模型进入错误解析路径并产生幻觉
+    （同一张问卷图：模板默认 40 行正确 vs document parsing. 43 行全幻觉）。
+    """
+    for prompt in ("<image>document parsing.", "<image>Multi page parsing."):
+        with mock.patch.object(sg.urllib.request, "urlopen", return_value=_FakeResp(
+            {"choices": [{"message": {"content": "<PAGE><BLOCK>text[0,0,1,1]<FORK>hi"}}]}
+        )) as m:
+            out = sg.llama_chat(prompt, [_make_image_path()])
+        assert out.startswith("<PAGE>")
+        payload = json.loads(m.call_args[0][0].data)
+        content = payload["messages"][0]["content"]
+        assert content[0]["type"] == "image_url"
+        # 内容里只有图片，没有默认指令文本
+        assert all(c["type"] == "image_url" for c in content), content
+        assert payload["skip_special_tokens"] is False
+        assert payload["dry_multiplier"] == sg.DRY_MULTIPLIER
+        assert payload["dry_allowed_length"] == sg.DRY_ALLOWED_LENGTH
+        assert payload["model"] == sg.ENGINE_MODEL_NAME
 
 
 def test_llama_chat_custom_prompt_appended_after_images():
@@ -285,3 +292,83 @@ def test_process_raw_output_paragraph_blank_line(tmp_path):
         assert "前半句\n后半句" in md2, repr(md2)
     finally:
         sg.IMAGES_DIR = old
+
+
+def test_is_junk_fragment():
+    """模型格式崩溃产生的碎片行应被识别；正常正文不能被误判。"""
+    junk = [
+        "[119, 1, 2, 0, 3, 0",
+        "image[0, 0, 999, 999]",
+        "[0, 0, 110, 200, 120, 200, 400, 400, 800, 800, 2000, 2000]",
+        "[0, 200, 800, 400, 2000]",
+        "[1]",
+        "...",
+        "。。",
+        "<FORK>",
+    ]
+    for s in junk:
+        assert sg._is_junk_fragment(s), s
+
+    normal = [
+        "1, 2, 3",
+        "[1] Smith et al.",
+        "普通正文一行。",
+        "The quick brown fox.",
+    ]
+    for s in normal:
+        assert not sg._is_junk_fragment(s), s
+
+
+def test_process_raw_output_drops_junk_fragments(tmp_path):
+    """坐标数组/残缺标签/纯标点行不得出现在 Markdown 结果中。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = (
+            "<BLOCK>text[0, 0, 999, 50]<FORK>正文内容\n"
+            "image[0, 0, 999, 999]\n"
+            "[119, 1, 2, 0, 3, 0\n"
+            "[0, 200, 800, 400, 2000]\n"
+            "[1]\n"
+            "[1]\n"
+            "...\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/junk")
+        assert "正文内容" in md, md
+        for bad in ("119, 1, 2", "image[0", "[1]", "..."):
+            assert bad not in md, (bad, md)
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_duplicate_block_prefix(tmp_path):
+    """模型偶发输出 <BLOCK><BLOCK>text[...]，应合并前缀后正常解析。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = "<BLOCK><BLOCK>text[0, 0, 999, 50]<FORK>双前缀正文\n"
+        md = sg.process_raw_output(raw, img, "unit/dupblock")
+        assert "双前缀正文" in md, md
+        assert "<BLOCK>" not in md, md
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_stream_loop_detected():
+    """流式早停：整行重复达阈值时判定循环；正常文档与短输出不得误判。"""
+    # 同一行重复 4 次 → 循环
+    loop = ["<BLOCK>text[0, 0, 999, 50]<FORK>Unlimited OCR Works"] * 25
+    assert sg._stream_loop_detected(loop)
+
+    # 行数不足阈值（正常短页）→ 不判定
+    short = ["<BLOCK>text[0, 0, 999, 50]<FORK>同一行"] * 10
+    assert not sg._stream_loop_detected(short)
+
+    # 正常多行内容 → 不判定
+    import random
+
+    random.seed(0)
+    normal = [f"<BLOCK>text[0, {i}, 999, {i + 10}]<FORK>第 {i} 段不同的正文内容" for i in range(40)]
+    assert not sg._stream_loop_detected(normal)
