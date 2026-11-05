@@ -1649,7 +1649,11 @@ async def chat_completions(req: ChatCompletionRequest):
         if is_pdf:
             import fitz  # PyMuPDF
             pdf_path = imgs[0]
-            pdf_dpi = 300
+            # PDF 转图 DPI：实测 150 与 300 DPI 的 OCR 结果一致（相似度 99.4%，
+            # 字符数差 1 个）——模型内部会把整页缩到固定 tile 网格（A4 约 448×672，
+            # 共 6 块），分辨率超过网格上限后的细节会被丢弃，150 DPI 已足够且
+            # 转图/解码开销更小。若后续遇到极小字（如批注、脚注）丢失可调回 300。
+            pdf_dpi = 150
             pdf_tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
             mat = fitz.Matrix(pdf_dpi / 72, pdf_dpi / 72)
             pdf_imgs = []
