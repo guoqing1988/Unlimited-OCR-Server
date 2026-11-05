@@ -4,18 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-Unlimited-OCR 是百度推出的单次长文档解析（One-shot Long-horizon Parsing）OCR 模型，基于 DeepSeek-OCR 进一步优化。该仓库主要是模型发布与推理示例代码，模型权重托管在 Hugging Face (`baidu/Unlimited-OCR`)。本地部署当前使用 **vLLM + FP8 后端**（2026-09 由 Transformers 版迁移），详见下方推理方式。
+Unlimited-OCR 是百度推出的单次长文档解析（One-shot Long-horizon Parsing）OCR 模型，基于 DeepSeek-OCR 进一步优化。该仓库主要是模型发布与推理示例代码，模型权重托管在 Hugging Face (`baidu/Unlimited-OCR` / `baidu/Unlimited-OCR-2`)。本地部署当前使用 **llama.cpp GGUF（Unlimited-OCR-2 Q8_0）后端**（2026-11 由 vLLM FP8 迁移，社区补丁版 llama.cpp），详见下方推理方式。
 
 ## 仓库结构
 
-- `server.py` — **Transformers 版（已停用，保留可回退）**：原生产版推理服务，端口 9705 已被 server_vllm.py 接管。
-- `server_vllm.py` — **核心（当前生产）**：OpenAI 兼容 FastAPI 适配层，API 与 server.py 完全一致；推理转发给下游 docker 容器内 vLLM 引擎（`vllm-ocr`，端口 9706）；空闲 900s 自动 `docker stop` 释放显存，下次请求自动拉起。监听 0.0.0.0:9705（原端口）。模型复用 `/data/www/models/Unlimited-OCR`。
+- `server_gguf.py` — **核心（当前生产）**：OpenAI 兼容 FastAPI 适配层，API 与 server_vllm.py 完全一致；推理转发给下游 llama-server 子进程（端口 9706，补丁版 llama.cpp + Unlimited-OCR-2 Q8_0 GGUF）；空闲 900s 自动停止子进程释放显存，下次请求自动拉起。监听 0.0.0.0:18001（端口由 .env 的 PORT 控制）。
+- `server_vllm.py` — **上一版生产（保留可回退）**：vLLM FP8 适配层，转发给 docker 容器 `vllm-ocr`，API 与 server_gguf.py 一致。
+- `server.py` — **Transformers 版（已停用，保留可回退）**：原生产版推理服务。
 - `infer.py` — 基于 SGLang 的并发批量推理脚本（保留，当前未使用）
 - `wheel/` — 预构建的 SGLang wheel 包（保留，当前未使用）
 - `assets/` — README 用到的图片和演示 GIF
 - `SERVER.md` — 服务器完整使用文档（API、输入方式、配置、示例代码）
-- `DEPLOY.md` — 部署文档（方案 B：原始 Transformers 版，保留）
-- `DEPLOY_VLLM.md` — 部署文档（方案 A：vLLM FP8，当前生产）
+- `DEPLOY_GGUF.md` — 部署文档（方案 C：llama.cpp GGUF，**当前生产**）
+- `DEPLOY.md` — 部署文档（方案 B：原始 Transformers 版，保留可回退）
+- `DEPLOY_VLLM.md` — 部署文档（方案 A：vLLM FP8，保留可回退）
 - `.env` — 环境配置（已 gitignore，含 API_KEY 等敏感信息）
 - `requirements.txt` — Python 依赖
 - `pyproject.toml` — 项目元数据
@@ -27,10 +29,10 @@ Unlimited-OCR 是百度推出的单次长文档解析（One-shot Long-horizon Pa
 
 ## 推理方式
 
-1. **vLLM + FP8（当前生产方案）**：官方镜像 `vllm/vllm-openai:unlimited-ocr`（docker 容器 `vllm-ocr`），`--quantization fp8` 动态量化（无需预转权重），`server_vllm.py` 适配层转发。实测 FP8 显存 ~8GB（`--gpu-memory-utilization 0.2`）、单页 3.3s（Transformers 版 9s，快 2.7 倍）、质量与 bf16 一致；**支持完整 R-SWA**（llama.cpp 尚未合入）。驱动要求 CUDA 12.9+（本机 580.17 / CUDA 13.0 满足）。
-2. **Transformers（已停用，可回退）**：`server.py`，本机直接加载 bf16 权重（~8.6GB 显存、单页 9s）。保留在仓库中，若 vLLM 出问题可 `systemctl enable --now unlimited-ocr.service` 回退（需先将端口让回）。
-3. **SGLang** — `infer.py` 和 wheel 包提供（当前系统 torch 在 Python 3.12.9 上 segfault，未使用）。
-4. **llama.cpp GGUF**（已实测，不建议）：Q4_K_M 量化质量劣化明显（正文幻觉/重复），且 R-SWA 未合入 master，长文档行为不等价。
+1. **llama.cpp GGUF + Unlimited-OCR-2（当前生产方案）**：补丁版 llama.cpp（`/data1/www/llama-ocr2`，基于 b11913 + `unlimited-ocr2.patch`），模型 `/data1/models/Unlimited-OCR-2-GGUF/Unlimited-OCR-2-Q8_0.gguf` + `mmproj-Unlimited-OCR-2-F16.gguf`。实测单页 ~5s、生成 ~250-280 t/s、显存 6.0GB（4k ctx）/8.4GB（32k ctx）。注意：主线 llama.cpp **不支持** `unlimited-ocr2` 架构，必须用补丁版；补丁只支持单序列（`-np 1`），DASH 稀疏注意力以全 KV mask 实现（结果等价、无加速）。
+2. **vLLM + FP8（2026-09 上一版生产，保留可回退）**：官方镜像 `vllm/vllm-openai:unlimited-ocr`（docker 容器 `vllm-ocr`），`--quantization fp8`，`server_vllm.py` 适配层转发。实测 FP8 显存 ~8GB、单页 3.3s。需要 v1 权重 `/data/www/models/Unlimited-OCR`（本机当前缺失）。
+3. **Transformers（已停用，可回退）**：`server.py`，本机直接加载 bf16 权重。
+4. **SGLang** — v2 官方推荐方案（定制 wheel + Python 3.10），长文档 SR-SWA 加速更完整，当前未部署。
 
 ## 常用命令
 
@@ -43,51 +45,55 @@ uv pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.py
 uv pip install -r requirements.txt
 ```
 
-### 启动 OCR 服务（当前生产 = vLLM 适配层）
+### 启动 OCR 服务（当前生产 = llama.cpp GGUF 适配层）
 
-> 2026-09：Transformers 版（server.py）已停用并禁用 systemd（unlimited-ocr.service），
-> 由 vLLM FP8 适配层（server_vllm.py）接管原 9705 端口，客户端零感知。
+> 2026-11：vLLM FP8 版（server_vllm.py）保留可回退，由 llama.cpp GGUF 适配层
+> （server_gguf.py + Unlimited-OCR-2 Q8_0）对外提供 18001 端口（.env 的 PORT/HOST 可配），客户端零感知。
 
 ```shell
-# 1) 首次手动启动下游 vLLM 引擎容器（之后由适配层自动管理启停）
-docker run -d --name vllm-ocr \
-  --gpus '"device=0"' --ipc host -p 9706:8000 \
-  -v /data/www/models/Unlimited-OCR:/models/Unlimited-OCR:ro \
-  vllm/vllm-openai:unlimited-ocr \
-  /models/Unlimited-OCR --served-model-name Unlimited-OCR \
-  --trust-remote-code \
-  --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor \
-  --no-enable-prefix-caching --mm-processor-cache-gb 0 \
-  --quantization fp8 --gpu-memory-utilization 0.2 \
-  --max-model-len 32768 --host 0.0.0.0 --port 8000
+# 0) 首次准备补丁版 llama-server（已编译好则跳过）
+cd /data1/www/llama-ocr2   # b11913 + unlimited-ocr2.patch
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+cmake --build build -j 48 --target llama-server llama-mtmd-cli
 
-# 2) 适配层以 systemd 服务方式运行（unlimited-ocr-vllm.service）
-sudo systemctl enable --now unlimited-ocr-vllm   # 端口 0.0.0.0:9705（原端口）
-sudo systemctl status unlimited-ocr-vllm
-sudo journalctl -u unlimited-ocr-vllm -f
+# 1) Python 虚拟环境（适配层只依赖 FastAPI/Pillow/PyMuPDF，不加载 torch）
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python fastapi "uvicorn[standard]" pydantic \
+  python-dotenv python-multipart requests pillow pymupdf
+
+# 2) 适配层以 systemd 服务方式运行（unlimited-ocr-gguf.service）
+sudo cp unlimited-ocr-gguf.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now unlimited-ocr-gguf   # 监听地址/端口取 .env 的 HOST/PORT（当前 0.0.0.0:18001）
+sudo systemctl status unlimited-ocr-gguf
+sudo journalctl -u unlimited-ocr-gguf -f
 ```
 
-适配层空闲 900s（IDLE_UNLOAD_SECONDS）后自动 `docker stop vllm-ocr` 释放显存；
-下一次请求到达时自动 `docker start` + 等待引擎就绪（冷启动约 30-40s）再推理。
-手动卸载：`curl -X POST localhost:9705/admin/unload`。
+适配层空闲 900s（IDLE_UNLOAD_SECONDS）后自动停止 llama-server 释放显存；
+下一次请求到达时自动拉起（冷启动约 5s，模型文件在页缓存中）。
+手动卸载：`curl -X POST localhost:18001/admin/unload`。
+引擎日志：`log/llama-server.log`（由 `LLAMA_LOG` 控制）。
 
-注意：service 中 ExecStart 端口为硬编码 9705（不用 ${PORT} 变量），
-避免与 .env 里遗留的 PORT 值产生变量展开歧义。
+关键参数（.env 可覆盖）：
+- `HOST=0.0.0.0`、`PORT=18001`（unit 用 `${HOST}`/`${PORT}` 展开，.env 优先于 unit 默认值）
+- `LLAMA_GPU=7`（使用 GPU 7）、`LLAMA_CTX=32768`（显存 ~8.4GB；8192 约 6.4GB）
+- `DRY_MULTIPLIER=0.8` 等 DRY 参数（防短句循环）
+- `LLAMA_MAX_IMAGES_PER_REQ=3`（batch 模式每批页数）
 
 ### 测试 API
 
 ```shell
 # 健康检查
-curl http://localhost:9705/health | python3 -m json.tool
+curl http://localhost:18001/health | python3 -m json.tool
 
 # 单图 OCR
-curl -s http://localhost:9705/v1/chat/completions \
+curl -s http://localhost:18001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <key>" \
   -d '{"model":"Unlimited-OCR","messages":[{"role":"user","content":[{"type":"text","text":"<image>document parsing."},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}],"max_tokens":4096}'
 
 # 手动卸载模型
-curl -X POST http://localhost:9705/admin/unload -H "Authorization: Bearer <key>"
+curl -X POST http://localhost:18001/admin/unload -H "Authorization: Bearer <key>"
 
 # 本地图片路径
 curl ... -d '{"messages":[{...,"image_url":{"url":"/home/liu/page.png"}}]}'
@@ -96,27 +102,28 @@ curl ... -d '{"messages":[{...,"image_url":{"url":"/home/liu/page.png"}}]}'
 curl ... -d '{"messages":[{...,"image_url":{"url":"/data/docs/report.pdf"}}]}'
 ```
 
-## 服务架构（vLLM FP8 版，当前生产）
+## 服务架构（llama.cpp GGUF 版，当前生产）
 
 ```
-Client ──► :9705 ──► FastAPI (server_vllm.py 适配层, systemd)
+Client ──► :18001 ──► FastAPI (server_gguf.py 适配层, systemd)
                         │
-                        ├─ 懒加载: 请求到达 → docker start vllm-ocr（若已空闲卸载）
-                        ├─ 空闲卸载: _watchdog() 900s 空闲后 docker stop vllm-ocr
+                        ├─ 懒加载: 请求到达 → subprocess 启动 llama-server（若已空闲卸载）
+                        ├─ 空闲卸载: _watchdog() 900s 空闲后 terminate llama-server
                         ├─ 认证中间件: Bearer Token（/health & /images/ 白名单）
                         │
-                        ├─ 单图: vllm_chat() 转发 1 图（vLLM 自动 crop gundam 640）
-                        └─ 多图: vllm_chat() 转发多图（vLLM 自动 base 1024 + <PAGE>）
+                        ├─ 单图: llama_chat() 只发图片（模板自动 <PAGE><image>Multi page parsing.）
+                        └─ 多图 batch: llama_chat() 一次发多图（每批 ≤ LLAMA_MAX_IMAGES_PER_REQ）
                                   │          │
-                                  └─ 下游引擎 docker 容器 vllm-ocr :9706
-                                              (vLLM FP8 + R-SWA, --gpu-memory-utilization 0.2)
-                                              └─ process_raw_output() 解析 <|det|> 标签
-                                                   ├─ header→#, title→##, subtitle→###
-                                                   ├─ text 段落合并/列表识别
-                                                   └─ image 坐标裁剪 + alt 文本
+                                  └─ 下游 llama-server :9706
+                                              (补丁版 llama.cpp + Q8_0 GGUF + DASH attention)
+                                              └─ process_raw_output() 解析 v2 标签
+                                                   ├─ <BLOCK>header/title/subtitle → #/##/###
+                                                   ├─ <BLOCK>text / image_caption → 段落合并
+                                                   ├─ <BLOCK>image → 坐标裁剪 + alt 文本
+                                                   └─ <MERGE> → 跨页同段合并
 ```
 
-> 旧 Transformers 架构参考 git 历史（server.py 仍在仓库，可随时回退）。
+> 旧 vLLM 架构参考 git 历史（server_vllm.py 仍在仓库，可随时回退）。
 
 ## API 端点
 
@@ -145,14 +152,20 @@ Client ──► :9705 ──► FastAPI (server_vllm.py 适配层, systemd)
 
 ## Markdown 输出规范
 
-模型输出 `<|det|>` 标签自动映射为 Markdown：
-- `header` → `#`, `title` → `##`, `subtitle` → `###`
-- `text` → 纯文本（同类型段落合并，序号自动识别为 `- ` 列表）
-- `image` → `![alt](images/{req_id}/N.jpg)`（alt 取最近标题）
-- 孤立行（无 det 标签）独立成块
+v2 模型输出 `<BLOCK>type[<LEVELn>][x1,y1,x2,y2]<FORK>文本` 标签，自动映射为 Markdown：
+- `<BLOCK>header[...]<FORK>` → `#`
+- `<BLOCK>title[...]<FORK>` → `##`（`<LEVEL2>` → `###`）
+- `<BLOCK>subtitle[...]<FORK>` → `###`
+- `<BLOCK>text[...]<FORK>` / `image_caption` → 纯文本（同类型段落合并，序号自动识别为 `- ` 列表）
+- `<BLOCK>image[...]<FORK>` → `![alt](images/{req_id}/N.jpg)`（alt 取最近标题）
+- `<MERGE>` → 跨页同段合并（后续文本块与上一块之间不加空行）
+- 孤立行（无 BLOCK 标签）独立成块
 
+坐标仍为 [0, 999] 归一化值（兼容全角逗号等模型噪声）。
 注意：`image` 标签仅在实际裁剪保存成功后才输出链接；若裁剪失败（坐标无效、
 原图损坏等），该图片不输出，避免生成 404 死链。
+
+> v1 的 `<|det|>...<|/det|>` 解析逻辑保留在 server_vllm.py 中，回退时使用。
 
 ## 编码规范
 

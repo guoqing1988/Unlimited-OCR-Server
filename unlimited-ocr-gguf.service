@@ -1,0 +1,35 @@
+[Unit]
+Description=Unlimited-OCR API 服务 (llama.cpp GGUF 适配层，Unlimited-OCR-2 Q8_0)
+Documentation=https://github.com/baidu/Unlimited-OCR
+# 依赖：补丁版 llama-server 由本服务按需以子进程方式拉起，
+# 不依赖 docker；空闲 900s 自动停止子进程释放显存。
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data1/www/Unlimited-OCR
+Environment="PATH=/data1/www/Unlimited-OCR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# ── 默认值（可被下方 EnvironmentFile 中的同名变量覆盖）──
+Environment="HOST=0.0.0.0"
+Environment="PORT=18001"
+Environment="LLAMA_GPU=7"
+Environment="LLAMA_CTX=32768"
+# .env 可选（不存在时使用上方默认值）。
+# 必须放在 Environment= 之后：systemd 按出现顺序应用，后面的同名变量生效。
+EnvironmentFile=-/data1/www/Unlimited-OCR/.env
+# 端口/监听地址从环境变量展开（.env > 上方默认值）。
+ExecStart=/data1/www/Unlimited-OCR/.venv/bin/uvicorn server_gguf:app --host ${HOST} --port ${PORT}
+# SIGTERM 触发 FastAPI shutdown → 停止 llama-server 子进程，避免残留占显存
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=40
+
+# GPU 访问权限
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

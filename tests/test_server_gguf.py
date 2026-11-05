@@ -1,0 +1,212 @@
+"""server_gguf.py（llama.cpp GGUF 后端适配层）单元测试。
+
+覆盖内容：
+1. _build_engine_cmd：llama-server 启动参数（--jinja / -np 1 / -c / --alias）
+2. llama_chat：请求构造——默认指令不随文本发送（否则模板会把文本放到图片前，
+   导致多页只输出第一页）；自定义指令追加在图片之后；DRY 防重复参数齐全；
+   引擎错误时抛 RuntimeError
+3. process_raw_output：v2 的 <BLOCK>type[box]<FORK>text 格式解析为与原版一致的
+   Markdown（标题层级、图片裁剪链接、footer 跳过、<MERGE> 清理、全角逗号容错）
+4. strip_hallucinations：循环行/越界行过滤，且能容忍非数字坐标
+
+说明：全部为纯逻辑测试（mock 网络），不依赖 9706 llama-server 或 GPU，
+可在无模型环境离线运行。
+"""
+
+import io
+import json
+import tempfile
+import unittest.mock as mock
+from pathlib import Path
+
+from PIL import Image
+
+import server_gguf as sg
+
+
+def _make_image_path(width: int = 200, height: int = 300) -> str:
+    """生成一张纯色测试图，返回临时文件路径。"""
+    img = Image.new("RGB", (width, height), (50, 120, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    f.write(buf.getvalue())
+    f.close()
+    return f.name
+
+
+class _FakeResp:
+    """urllib.request.urlopen 的假响应。"""
+
+    def __init__(self, payload: dict):
+        self._body = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 引擎启动参数
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_build_engine_cmd_basic():
+    """启动命令必须带 --jinja、单 slot、指定上下文与端口、统一 alias。"""
+    cmd = sg._build_engine_cmd()
+    assert sg.LLAMA_SERVER_BIN in cmd
+    assert "--jinja" in cmd
+    assert "-np" in cmd and cmd[cmd.index("-np") + 1] == "1"
+    assert "-c" in cmd and cmd[cmd.index("-c") + 1] == str(sg.LLAMA_CTX)
+    assert "--mmproj" in cmd
+    assert "--alias" in cmd and cmd[cmd.index("--alias") + 1] == sg.ENGINE_MODEL_NAME
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# llama_chat 请求构造
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_llama_chat_default_prompt_sends_images_only():
+    """默认指令由 chat template 生成，请求体里不应出现 text 块。"""
+    with mock.patch.object(sg.urllib.request, "urlopen", return_value=_FakeResp(
+        {"choices": [{"message": {"content": "<PAGE><BLOCK>text[0,0,1,1]<FORK>hi"}}]}
+    )) as m:
+        out = sg.llama_chat("<image>document parsing.", [_make_image_path()])
+    assert out.startswith("<PAGE>")
+    payload = json.loads(m.call_args[0][0].data)
+    content = payload["messages"][0]["content"]
+    assert all(block["type"] == "image_url" for block in content)
+    assert payload["skip_special_tokens"] is False
+    assert payload["dry_multiplier"] == sg.DRY_MULTIPLIER
+    assert payload["dry_allowed_length"] == sg.DRY_ALLOWED_LENGTH
+    assert payload["model"] == sg.ENGINE_MODEL_NAME
+
+
+def test_llama_chat_custom_prompt_appended_after_images():
+    """自定义指令放在图片之后，避免模板把文本渲染到图片前。"""
+    with mock.patch.object(sg.urllib.request, "urlopen", return_value=_FakeResp(
+        {"choices": [{"message": {"content": "ok"}}]}
+    )) as m:
+        sg.llama_chat("<image>请提取表格", [_make_image_path()])
+    payload = json.loads(m.call_args[0][0].data)
+    content = payload["messages"][0]["content"]
+    assert content[0]["type"] == "image_url"
+    assert content[-1]["type"] == "text"
+    assert content[-1]["text"] == "请提取表格"
+
+
+def test_llama_chat_engine_error_raises():
+    """引擎不可达时必须抛出 RuntimeError（由上层转 500）。"""
+    import urllib.error
+    with mock.patch.object(sg.urllib.request, "urlopen",
+                           side_effect=urllib.error.URLError("boom")):
+        try:
+            sg.llama_chat("Multi page parsing.", [_make_image_path()])
+        except RuntimeError as e:
+            assert "llama-server" in str(e)
+        else:
+            raise AssertionError("expected RuntimeError")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# process_raw_output：v2 标签 → Markdown
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_process_raw_output_v2_markdown(tmp_path):
+    """header/title/subtitle/text 映射、footer 跳过、image 裁剪链接生成。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = (
+            "<PAGE><BLOCK>header[0, 0, 999, 50]<FORK>MAIN TITLE\n"
+            "<BLOCK>title<LEVEL1>[0, 60, 500, 100]<FORK>Section One\n"
+            "<BLOCK>title<LEVEL2>[0, 110, 500, 140]<FORK>Sub Section\n"
+            "<BLOCK>text[0, 160, 999, 200]<FORK>Hello world.\n"
+            "<BLOCK>image[100, 220, 400, 500]<FORK>\n"
+            "<BLOCK>footer[0, 960, 999, 990]<FORK>page footer\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/page_0")
+        assert md.startswith("# MAIN TITLE")
+        assert "## Section One" in md
+        assert "### Sub Section" in md
+        assert "Hello world." in md
+        assert "page footer" not in md
+        # alt 取最近遇到的标题（此例为 title<LEVEL2> 的 Sub Section）
+        assert "![Sub Section](images/unit/page_0/0.jpg)" in md
+        assert (tmp_path / "unit" / "page_0" / "0.jpg").is_file()
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_merge_marker_cleared(tmp_path):
+    """<MERGE> 标记必须从输出中清除，跨页文本连续输出。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = (
+            "<BLOCK>text[0, 0, 999, 50]<FORK>first part\n"
+            "<MERGE>\n"
+            "<BLOCK>text[0, 60, 999, 100]<FORK>continued part\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/page_1")
+        assert "<MERGE>" not in md
+        assert "<PAGE>" not in md
+        assert md.index("first part") < md.index("continued part")
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_fullwidth_comma(tmp_path):
+    """模型偶发全角逗号坐标时不得崩溃（跳过该图即可）。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = "<BLOCK>image[884， 239, 900, 300]<FORK>\n<BLOCK>text[0, 0, 100, 20]<FORK>ok\n"
+        md = sg.process_raw_output(raw, img, "unit/page_2")
+        assert "ok" in md
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_image_failure_no_dead_link(tmp_path):
+    """坐标无效导致裁剪失败时，不输出图片链接（避免 404）。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = "<BLOCK>image[500, 500, 100, 100]<FORK>\n<BLOCK>text[0, 0, 100, 20]<FORK>text only\n"
+        md = sg.process_raw_output(raw, img, "unit/page_3")
+        assert "![" not in md
+        assert "text only" in md
+    finally:
+        sg.IMAGES_DIR = old
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 幻觉护栏
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_strip_hallucinations_drops_loop_and_out_of_page():
+    """行内循环与越界 y 坐标行应被丢弃，正常行保留。"""
+    raw = (
+        "<BLOCK>text[0, 100, 200, 120]<FORK>Normal line.\n"
+        "<BLOCK>text[0, 100, 200, 120]<FORK>The first, The first, The first, The first\n"
+        "<BLOCK>text[0, 996, 200, 999]<FORK>Out of page line\n"
+    )
+    out = sg.strip_hallucinations(raw)
+    assert "Normal line." in out
+    assert "The first, The first, The first" not in out
+    assert "Out of page line" not in out
+
+
+def test_strip_hallucinations_tolerates_bad_coords():
+    """坐标含全角逗号或非数字时不得抛异常。"""
+    raw = "<BLOCK>text[884， 239, 900, 300]<FORK>abc\n"
+    assert "abc" in sg.strip_hallucinations(raw)
