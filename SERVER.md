@@ -410,12 +410,26 @@ resp = requests.post(
 
 | 上一行类型 | 当前行类型 | 行为 |
 |-----------|-----------|------|
-| text | text | 合并（不加空行） |
+| text | text | **加空行**（v2 每个 `<BLOCK>text` 是独立段落） |
+| text | text（`<MERGE>`） | 不加空行（跨页续写，同一段落） |
 | text | title/header | 加空行 |
 | text | image | 加空行 |
 | image | image | 合并 |
 | image | text | 加空行 |
+| 列表项 | 列表项 | 不加空行（List 紧凑） |
 | orphan | 任何 | 前后加空行 |
+
+> 标准 Markdown 中单个换行只是软换行，渲染时会被并成同一段；
+> 所以适配层用空行分隔段落，保证渲染后每个文本块独立成段。
+
+### 重复图片去重
+
+v2 模型在双栏 + 大图版面偶发把同一张图输出两次（坐标几乎相同，中间还可能夹着正文），
+直接裁剪会得到两张一模一样的图片。适配层对本页已输出图片做 IoU 去重：
+
+- 与已输出图片 IoU ≥ `IMAGE_DEDUP_IOU`（默认 `0.85`）→ 跳过不输出
+- 不同位置的图片不受影响（IoU 很低）
+- 设 `IMAGE_DEDUP_IOU=0` 可关闭去重
 
 ### 列表识别
 
@@ -551,6 +565,7 @@ tail -f /data1/www/Unlimited-OCR/log/llama-server.log
 | `DRY_BASE` | `1.75` | DRY 基础惩罚 |
 | `DRY_ALLOWED_LENGTH` | `2` | DRY 允许重复长度 |
 | `DRY_PENALTY_LAST_N` | `256` | DRY 回看窗口 |
+| `IMAGE_DEDUP_IOU` | `0.85` | 重复图片去重阈值（IoU，0=关闭） |
 | `ENGINE_MODEL_NAME` | `Unlimited-OCR` | 引擎 alias（`--alias`） |
 | `SERVED_MODEL_NAME` | `Unlimited-OCR` | API 响应的模型名 |
 | `IDLE_UNLOAD_SECONDS` | `900` | 空闲后停止引擎(秒) |

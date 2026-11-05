@@ -165,6 +165,12 @@ MAX_PAGES_PER_BATCH = int(os.environ.get("MAX_PAGES_PER_BATCH", "20"))
 # OCR 过程中提取的图片存放目录，按请求 ID 分子目录
 IMAGES_DIR = Path(__file__).parent / "images"
 
+# ── 重复图片去重 ──────────────────────────────────────────────────────
+# v2 模型在双栏/大图版面偶发把同一张图输出两次（坐标几乎相同，前后可能夹着正文），
+# 直接裁剪会得到两张一模一样的图片。与已输出图片的 IoU ≥ 本阈值时视为重复并跳过。
+# 设为 0 可关闭去重。
+IMAGE_DEDUP_IOU = float(os.environ.get("IMAGE_DEDUP_IOU", "0.85"))
+
 # ── 引擎健康状态 ───────────────────────────────────────────────────────────
 _state_lock = threading.Lock()   # 保护状态字段
 _infer_lock = threading.Lock()   # 推理互斥，保证单 GPU 串行
@@ -967,6 +973,38 @@ def strip_hallucinations(raw_text: str) -> str:
     return '\n'.join(out)
 
 
+def _box_iou(a, b) -> float:
+    """
+    计算两个 [x1, y1, x2, y2] 矩形框的交并比（IoU）。
+
+    坐标可以是任意同一量纲（本模块传 [0,999] 归一化坐标）。
+    坐标长度不足 4 或面积为零时返回 0.0（不参与去重判断）。
+
+    Args:
+        a: 矩形 A 坐标序列
+        b: 矩形 B 坐标序列
+
+    Returns:
+        0.0–1.0 的 IoU 值。
+    """
+    try:
+        ax1, ay1, ax2, ay2 = float(a[0]), float(a[1]), float(a[2]), float(a[3])
+        bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
 def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> str:
     """
     将 v2 模型返回的 raw 文本处理为完整 Markdown。
@@ -1044,6 +1082,7 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
     result_lines = []         # 最终输出的 Markdown 行列表
     last_heading = ""         # 记录最近遇到的标题文本，作为后续图片的 alt
     image_idx = 0             # 图片序号，用于文件命名（N.jpg）
+    seen_image_boxes = []     # 本页已输出图片的坐标，用于重复图片去重
     prev_type = ""            # 上一块类型
     prev_is_listish_flag = False  # 上一行是否为列表项（用于连续列表项合并）
     merge_next = False        # <MERGE>：下一块与上一块合并（不加空行）
@@ -1100,7 +1139,9 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
         if mapping is None:
             # 未知类型 → 视为 text
             if text_after:
-                if prev_type not in ("", "text") or prev_is_listish_flag:
+                # v2 每个 <BLOCK> 是独立段落，段落之间需要空行
+                # （标准 Markdown 中单个换行只是软换行，渲染时会并成同一段）。
+                if not merge_next and prev_type not in ("",) and not prev_is_listish_flag:
                     result_lines.append("")
                 result_lines.append(text_after)
                 prev_type = "text"
@@ -1132,8 +1173,22 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
 
             # 记录实际保存成功的子图文件名（裁剪失败的图片不会生成链接）
             saved_files: list[str] = []
+            dup_skipped = 0  # 因重复被跳过的子图数（用于区分日志级别）
 
             for ci, c in enumerate(coords):
+                # ── 重复图片去重 ──
+                # v2 模型在双栏/大图版面偶发把同一张图输出两次（坐标几乎相同，
+                # 两次之间还可能夹着正文），不去重会得到两张一模一样的图片。
+                if IMAGE_DEDUP_IOU > 0 and any(
+                    _box_iou(c, b) >= IMAGE_DEDUP_IOU for b in seen_image_boxes
+                ):
+                    logger.info(
+                        "重复图片跳过: req_id=%s 坐标=%s（与已输出图片 IoU ≥ %.2f）",
+                        req_id, c, IMAGE_DEDUP_IOU,
+                    )
+                    dup_skipped += 1
+                    continue
+
                 fname = f"{image_idx}{('_' + str(ci)) if len(coords) > 1 else ''}.jpg"
                 try:
                     # 将 [0,999] 归一化坐标映射到实际像素坐标
@@ -1146,6 +1201,8 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                         cropped = orig_img.crop((x1, y1, x2, y2))
                         cropped.save(str(img_dir / fname))
                         saved_files.append(fname)
+                        # 只记录实际输出到 Markdown 的图片
+                        seen_image_boxes.append(tuple(c))
                     else:
                         logger.warning(
                             "图片裁剪跳过: req_id=%s 文件=%s 坐标=%s 原图=%s 原因=%s",
@@ -1162,10 +1219,17 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
 
             # 只有实际保存成功的图片才生成 Markdown 链接（避免死链 404）
             if not saved_files:
-                logger.warning(
-                    "图片裁剪全部失败，跳过输出: req_id=%s 坐标=%s",
-                    req_id, coords_str,
-                )
+                if dup_skipped == len(coords):
+                    # 整块都是重复图 → 去重的正常结果，不是异常
+                    logger.info(
+                        "整块图片重复，已跳过: req_id=%s 坐标=%s",
+                        req_id, coords_str,
+                    )
+                else:
+                    logger.warning(
+                        "图片裁剪全部失败，跳过输出: req_id=%s 坐标=%s",
+                        req_id, coords_str,
+                    )
                 merge_next = False
                 continue
 
@@ -1205,8 +1269,10 @@ def process_raw_output(raw_text: str, original_image_path: str, req_id: str) -> 
                         result_lines.append("- " + text_after)
                         prev_is_listish_flag = True
                     else:
-                        # <MERGE> 或上一块是普通正文 → 不加空行，保持同一段落
-                        if not merge_next and (prev_type not in ("", "text") or prev_is_listish_flag):
+                        # v2 每个 <BLOCK>text 是一个独立段落，段间必须用空行分隔，
+                        # 否则标准 Markdown 渲染时会被合并成同一段（单换行不算换段）。
+                        # 例外：<MERGE> 跨页续写、连续列表项不加空行。
+                        if not merge_next and prev_type not in ("",) and not prev_was_listish:
                             result_lines.append("")
                         result_lines.append(md_line)
                         prev_is_listish_flag = False

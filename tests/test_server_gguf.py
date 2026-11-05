@@ -210,3 +210,78 @@ def test_strip_hallucinations_tolerates_bad_coords():
     """坐标含全角逗号或非数字时不得抛异常。"""
     raw = "<BLOCK>text[884， 239, 900, 300]<FORK>abc\n"
     assert "abc" in sg.strip_hallucinations(raw)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 重复图片去重（v2 双栏/大图版面会把同一张图输出两次）
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_box_iou():
+    """IoU：同一框=1，无交集=0，部分重叠介于两者之间。"""
+    assert sg._box_iou([0, 0, 100, 100], [0, 0, 100, 100]) == 1.0
+    assert sg._box_iou([0, 0, 10, 10], [50, 50, 60, 60]) == 0.0
+    part = sg._box_iou([0, 0, 100, 100], [0, 0, 100, 50])
+    assert 0.4 < part < 0.6
+    assert sg._box_iou([0, 0], [1, 1, 2, 2]) == 0.0  # 坐标不足 4 个不崩溃
+
+
+def test_process_raw_output_dedup_duplicate_image(tmp_path):
+    """同一张大图被模型输出两次（坐标几乎相同）时，只保留一张。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path(400, 600)
+        raw = (
+            "<PAGE><BLOCK>image[279, 302, 724, 967]<FORK>\n"
+            "<BLOCK>text[54, 461, 268, 517]<FORK>左侧正文\n"
+            "<BLOCK>image[279, 302, 724, 957]<FORK>\n"
+            "<BLOCK>text[743, 457, 959, 608]<FORK>右侧正文\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/dup")
+        assert md.count("![") == 1, md
+        assert "左侧正文" in md and "右侧正文" in md
+        files = list((tmp_path / "unit" / "dup").glob("*.jpg"))
+        assert len(files) == 1, files
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_keeps_distinct_images(tmp_path):
+    """不同位置的两张图不应被去重。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path(400, 600)
+        raw = (
+            "<BLOCK>image[10, 10, 200, 300]<FORK>\n"
+            "<BLOCK>image[500, 400, 900, 900]<FORK>\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/distinct")
+        assert md.count("![") == 2, md
+    finally:
+        sg.IMAGES_DIR = old
+
+
+def test_process_raw_output_paragraph_blank_line(tmp_path):
+    """v2 每个 text 块是独立段落：块间必须是空行，否则 Markdown 渲染会并成一段。"""
+    old = sg.IMAGES_DIR
+    sg.IMAGES_DIR = tmp_path
+    try:
+        img = _make_image_path()
+        raw = (
+            "<BLOCK>text[0, 0, 999, 50]<FORK>第一段\n"
+            "<BLOCK>text[0, 60, 999, 100]<FORK>第二段\n"
+        )
+        md = sg.process_raw_output(raw, img, "unit/para")
+        assert "第一段\n\n第二段" in md, repr(md)
+
+        # <MERGE> 表示跨页续写，同段落内不插空行
+        raw_merge = (
+            "<BLOCK>text[0, 0, 999, 50]<FORK>前半句\n"
+            "<MERGE>\n"
+            "<BLOCK>text[0, 60, 999, 100]<FORK>后半句\n"
+        )
+        md2 = sg.process_raw_output(raw_merge, img, "unit/para2")
+        assert "前半句\n后半句" in md2, repr(md2)
+    finally:
+        sg.IMAGES_DIR = old
